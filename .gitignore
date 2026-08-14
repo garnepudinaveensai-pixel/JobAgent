@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# API keys and credentials
+*.key
+*.pem
+secrets/
+credentials/
+
+# Personal data
+data/*
+!data/.gitkeep
+
+# Resumes and personal documents
+resumes/*
+!resumes/.gitkeep
+
+# Logs
+logs/*
+!logs/.gitkeep
+
+# Browser data
+browser_data/
+playwright/.cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Test/cache
+.pytest_cache/
+.coverage
+htmlcov/

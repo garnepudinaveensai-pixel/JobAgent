@@ -1,0 +1,20 @@
+{
+    "app": {
+        "name": "JobAgent",
+        "environment": "development",
+        "log_level": "INFO"
+    },
+    "job_search": {
+        "location": "India",
+        "max_results": 20
+    },
+    "browser": {
+        "headless": false,
+        "timeout": 30000
+    },
+    "paths": {
+        "resume_directory": "resumes",
+        "data_directory": "data",
+        "logs_directory": "logs"
+    }
+}
