@@ -1,7 +1,14 @@
 from contextlib import contextmanager
 from typing import Generator, Optional
+from urllib.parse import urlparse
 
-from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    sync_playwright,
+)
 
 
 class BrowserManager:
@@ -9,12 +16,14 @@ class BrowserManager:
     Centralized Playwright browser manager for JobAgent.
 
     Responsibilities:
-    - Start and stop Playwright safely
-    - Launch Chromium
-    - Create isolated browser contexts
-    - Create pages
-    - Reuse one browser instance during a workflow
-    - Clean up resources reliably
+    - Start and stop Playwright safely.
+    - Launch Chromium.
+    - Reuse one browser instance.
+    - Reuse one browser context during a session.
+    - Create multiple pages when required.
+    - Apply consistent timeouts.
+    - Validate URLs before navigation.
+    - Clean up resources reliably.
     """
 
     def __init__(
@@ -22,6 +31,11 @@ class BrowserManager:
         headless: bool = False,
         timeout: int = 30000,
     ):
+        if timeout <= 0:
+            raise ValueError(
+                "timeout must be greater than 0."
+            )
+
         self.headless = headless
         self.timeout = timeout
 
@@ -38,20 +52,27 @@ class BrowserManager:
         """
         Start Playwright and launch Chromium.
 
-        Returns:
-            BrowserManager: self, allowing chained usage.
+        Calling start() multiple times is safe.
+        The existing browser instance is reused.
         """
 
         if self._browser is not None:
             return self
 
-        self._playwright = sync_playwright().start()
+        try:
+            self._playwright = sync_playwright().start()
 
-        self._browser = self._playwright.chromium.launch(
-            headless=self.headless
-        )
+            self._browser = self._playwright.chromium.launch(
+                headless=self.headless,
+            )
 
-        return self
+            return self
+
+        except Exception:
+            # If startup fails, clean up anything that may
+            # have been partially initialized.
+            self.close()
+            raise
 
     # ========================================================
     # CONTEXT
@@ -59,10 +80,13 @@ class BrowserManager:
 
     def create_context(self) -> BrowserContext:
         """
-        Create a fresh browser context.
+        Create or reuse the active browser context.
 
-        A context provides isolated cookies, storage,
-        sessions, and browser state.
+        The context is reused for the lifetime of the
+        BrowserManager session.
+
+        This preserves cookies, local storage, and session
+        state between pages.
         """
 
         if self._browser is None:
@@ -71,18 +95,16 @@ class BrowserManager:
                 "Call start() first."
             )
 
-        if self._context is not None:
-            self._context.close()
+        if self._context is None:
+            self._context = self._browser.new_context()
 
-        self._context = self._browser.new_context()
+            self._context.set_default_timeout(
+                self.timeout,
+            )
 
-        self._context.set_default_timeout(
-            self.timeout
-        )
-
-        self._context.set_default_navigation_timeout(
-            self.timeout
-        )
+            self._context.set_default_navigation_timeout(
+                self.timeout,
+            )
 
         return self._context
 
@@ -92,7 +114,9 @@ class BrowserManager:
 
     def new_page(self) -> Page:
         """
-        Create a new page in a fresh browser context.
+        Create a new page inside the active browser context.
+
+        Multiple pages can now coexist during one session.
         """
 
         context = self.create_context()
@@ -107,7 +131,9 @@ class BrowserManager:
 
     @property
     def page(self) -> Optional[Page]:
-        """Return the currently active page."""
+        """
+        Return the most recently created page.
+        """
 
         return self._page
 
@@ -117,9 +143,60 @@ class BrowserManager:
 
     @property
     def browser(self) -> Optional[Browser]:
-        """Return the active browser instance."""
+        """
+        Return the active browser instance.
+        """
 
         return self._browser
+
+    # ========================================================
+    # CONTEXT
+    # ========================================================
+
+    @property
+    def context(self) -> Optional[BrowserContext]:
+        """
+        Return the active browser context.
+        """
+
+        return self._context
+
+    # ========================================================
+    # URL VALIDATION
+    # ========================================================
+
+    @staticmethod
+    def _validate_url(url: str) -> None:
+        """
+        Validate that a URL is a usable HTTP/HTTPS URL.
+        """
+
+        if not isinstance(url, str):
+            raise ValueError(
+                "URL must be a string."
+            )
+
+        url = url.strip()
+
+        if not url:
+            raise ValueError(
+                "URL cannot be empty."
+            )
+
+        parsed = urlparse(url)
+
+        if parsed.scheme not in {
+            "http",
+            "https",
+        }:
+            raise ValueError(
+                "URL must use http:// or https://."
+            )
+
+        if not parsed.netloc:
+            raise ValueError(
+                "URL must contain a valid hostname."
+            )
 
     # ========================================================
     # NAVIGATION
@@ -128,10 +205,11 @@ class BrowserManager:
     def open(self, url: str) -> Page:
         """
         Open a URL in a new page.
+
+        The browser is started automatically if necessary.
         """
 
-        if not url.strip():
-            raise ValueError("URL cannot be empty.")
+        self._validate_url(url)
 
         if self._browser is None:
             self.start()
@@ -139,11 +217,36 @@ class BrowserManager:
         page = self.new_page()
 
         page.goto(
-            url,
+            url.strip(),
             wait_until="domcontentloaded",
         )
 
         return page
+
+    # ========================================================
+    # CLOSE PAGE
+    # ========================================================
+
+    def close_page(self, page: Optional[Page] = None) -> None:
+        """
+        Close one page without shutting down the entire
+        browser session.
+
+        If no page is supplied, close the current page.
+        """
+
+        target = page or self._page
+
+        if target is None:
+            return
+
+        try:
+            target.close()
+        except Exception:
+            pass
+
+        if target is self._page:
+            self._page = None
 
     # ========================================================
     # CLOSE
@@ -151,16 +254,20 @@ class BrowserManager:
 
     def close(self) -> None:
         """
-        Safely close page, context, browser, and Playwright.
+        Safely close all Playwright resources.
+
+        Cleanup order:
+
+            page
+              ↓
+            context
+              ↓
+            browser
+              ↓
+            Playwright
         """
 
-        if self._page is not None:
-            try:
-                self._page.close()
-            except Exception:
-                pass
-
-            self._page = None
+        self.close_page()
 
         if self._context is not None:
             try:
@@ -191,7 +298,9 @@ class BrowserManager:
     # ========================================================
 
     def __enter__(self) -> "BrowserManager":
-        """Allow use with the `with` statement."""
+        """
+        Start the browser when entering a with-block.
+        """
 
         return self.start()
 
@@ -201,7 +310,9 @@ class BrowserManager:
         exc_value,
         traceback,
     ) -> None:
-        """Always clean up browser resources."""
+        """
+        Always clean up browser resources.
+        """
 
         self.close()
 
@@ -217,7 +328,11 @@ def browser_session(
     Example:
 
         with browser_session() as browser:
-            page = browser.open("https://example.com")
+            page = browser.open(
+                "https://example.com"
+            )
+
+    The browser is automatically closed when the block ends.
     """
 
     manager = BrowserManager(
