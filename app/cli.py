@@ -4,7 +4,7 @@ import argparse
 from typing import Optional
 
 from app.config import create_default_config
-from app.core.agent_runner import AgentRunner
+from app.main import create_runner
 from app.jobs.job_store import JobStore
 
 
@@ -276,7 +276,7 @@ def handle_discover(args) -> int:
     )
 
     try:
-        runner = AgentRunner()
+        runner = create_runner()
 
         results = runner.discover_and_match(
             board_url=args.board_url,
@@ -404,7 +404,7 @@ def handle_discover(args) -> int:
             "Storing discovered jobs..."
         )
 
-        runner = AgentRunner()
+        runner = create_runner()
 
         jobs = [
             result.get(
