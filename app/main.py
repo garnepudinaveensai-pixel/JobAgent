@@ -11,6 +11,7 @@ from app.config import (
     create_default_config,
 )
 from app.core.agent_runner import AgentRunner
+from app.jobs.job_store import JobStore
 
 
 # ============================================================
@@ -22,38 +23,115 @@ def load_config() -> JobAgentConfig:
     """
     Load the default JobAgent configuration.
 
-    This function can later be extended to support:
-
-    - environment variables
-    - .env files
-    - JSON configuration
-    - YAML configuration
-    - user-specific configuration
+    This can later be extended to support:
+        - environment variables
+        - .env files
+        - JSON configuration
+        - YAML configuration
+        - user-specific configuration
     """
 
     return create_default_config()
+
+
+# ============================================================
+# RUNNER CREATION
+# ============================================================
 
 
 def create_runner(
     config: Optional[JobAgentConfig] = None,
 ) -> AgentRunner:
     """
-    Create and initialize an AgentRunner.
+    Create a fully wired AgentRunner.
 
-    If a configuration is supplied, it is used directly.
-    Otherwise, the default configuration is loaded.
+    Components:
 
-    Required directories are created before the runner
-    is returned.
+        JobStore
+            ↓
+        BrowserManager
+            ↓
+        ResumeManager
+            ↓
+        JobMatchPipeline
+            ↓
+        AgentRunner
+
+    The same JobStore instance is shared with AgentRunner.
+
+    IMPORTANT:
+        This function intentionally does NOT call
+        config.validate().
+
+        Tests and programmatic callers may create a default
+        JobAgentConfig with notifications enabled but without
+        an email address.
+
+        Runtime validation is performed by main() after the
+        runtime-safe configuration has been prepared.
     """
+
+    # --------------------------------------------------------
+    # Load configuration
+    # --------------------------------------------------------
 
     if config is None:
         config = load_config()
 
+    # --------------------------------------------------------
+    # Prepare required directories
+    # --------------------------------------------------------
+
     config.ensure_directories()
+
+    # --------------------------------------------------------
+    # Shared JobStore
+    # --------------------------------------------------------
+
+    job_store = JobStore(
+        storage_path=config.storage.jobs_file,
+    )
+
+    # --------------------------------------------------------
+    # Browser
+    # --------------------------------------------------------
+
+    from app.browser.browser_manager import BrowserManager
+
+    browser = BrowserManager(
+        headless=False,
+    )
+
+    # --------------------------------------------------------
+    # Resume manager
+    # --------------------------------------------------------
+
+    from app.resume.resume_manager import ResumeManager
+
+    resume_manager = ResumeManager(
+        resume_directory="resumes",
+        cache_directory="data/cache/resumes",
+    )
+
+    # --------------------------------------------------------
+    # Job discovery + matching pipeline
+    # --------------------------------------------------------
+
+    from app.core.job_match_pipeline import JobMatchPipeline
+
+    job_match_pipeline = JobMatchPipeline(
+        browser=browser,
+        resume_manager=resume_manager,
+    )
+
+    # --------------------------------------------------------
+    # Fully wired AgentRunner
+    # --------------------------------------------------------
 
     return AgentRunner(
         config=config,
+        job_store=job_store,
+        job_match_pipeline=job_match_pipeline,
     )
 
 
@@ -67,13 +145,8 @@ def load_settings() -> dict:
     Backward-compatible loader for the old settings.json
     format.
 
-    The newer JobAgent architecture uses JobAgentConfig.
-
-    Returns:
-        Dictionary containing legacy settings.
-
-    If config/settings.json does not exist, an empty
-    dictionary is returned.
+    Returns an empty dictionary when the legacy settings file
+    does not exist.
     """
 
     settings_path = Path(
@@ -115,26 +188,24 @@ def _prepare_runtime_config(
     """
     Prepare a safe runtime copy of the configuration.
 
-    A fresh installation may have notifications enabled but
-    no email address configured yet.
-
-    Instead of modifying the user's original configuration,
-    create a copy and disable notifications only for this
+    If notifications are enabled but no notification email
+    is configured, notifications are disabled only for this
     runtime session.
 
-    Other configuration errors are still allowed to fail
-    normally during validation.
+    The original configuration object is not modified.
     """
 
     runtime_config = copy.deepcopy(
         config
     )
 
+    notification = runtime_config.notification
+
     if (
-        runtime_config.notification.enabled
-        and not runtime_config.notification.email.strip()
+        notification.enabled
+        and not notification.email.strip()
     ):
-        runtime_config.notification.enabled = False
+        notification.enabled = False
 
     return runtime_config
 
@@ -281,11 +352,11 @@ def main(
         Delegate to the CLI.
 
     Without arguments:
-        Perform a safe startup and configuration check.
+        Perform safe startup and configuration check.
 
     Returns:
         0 on success.
-        1 on configuration/startup failure.
+        1 on startup/configuration failure.
     """
 
     # --------------------------------------------------------
@@ -309,24 +380,20 @@ def main(
     # --------------------------------------------------------
 
     try:
-        # Load user's configuration.
+        # Load original configuration.
         config = load_config()
 
-        # Create a runtime-safe copy.
+        # Create a safe runtime copy.
         runtime_config = _prepare_runtime_config(
             config
         )
 
-        # Validate the runtime configuration.
+        # Validate ONLY the runtime configuration.
         runtime_config.validate()
 
-        # Create required directories only after
-        # configuration has passed validation.
-        runtime_config.ensure_directories()
-
-        # Create high-level runner.
-        runner = AgentRunner(
-            config=runtime_config,
+        # Create the fully wired runner.
+        runner = create_runner(
+            config=runtime_config
         )
 
         # Display startup information.

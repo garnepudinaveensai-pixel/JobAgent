@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -12,26 +14,23 @@ class ApplicationPipeline:
     """
     Coordinates the JobAgent application workflow.
 
-    Current workflow:
+    Workflow:
 
         Job
           ↓
-        Match against resume
+        Match
           ↓
-        Register job
+        Register
           ↓
-        Prepare application
+        Prepare
           ↓
-        Validate application
+        Validate
           ↓
-        Explicit confirmation
+        Confirmation
           ↓
         Submit
           ↓
-        Track application status
-
-    This class does NOT automatically submit an application
-    without explicit confirmation.
+        Track
     """
 
     def __init__(
@@ -39,11 +38,17 @@ class ApplicationPipeline:
         job_store: Optional[JobStore] = None,
         application_tracker: Optional[ApplicationTracker] = None,
     ):
+        # ONE shared store for the entire application lifecycle.
         self.job_store = job_store or JobStore()
 
+        # Critical fix:
+        # If a tracker is not supplied, it MUST use the same
+        # JobStore instance.
         self.application_tracker = (
             application_tracker
-            or ApplicationTracker()
+            or ApplicationTracker(
+                store=self.job_store,
+            )
         )
 
     # ========================================================
@@ -55,17 +60,13 @@ class ApplicationPipeline:
         resume: Dict,
         job: Dict,
     ) -> Dict:
-        """
-        Evaluate how well a resume matches a job.
-        """
-
         return match_job(
             resume=resume,
             job=job,
         )
 
     # ========================================================
-    # REGISTER JOB
+    # REGISTER
     # ========================================================
 
     def register_job(
@@ -73,17 +74,13 @@ class ApplicationPipeline:
         job: Job | Dict,
         status: str = "discovered",
     ) -> str:
-        """
-        Store a job and return its stable job ID.
-        """
-
         return self.job_store.add_job(
             job=job,
             status=status,
         )
 
     # ========================================================
-    # PREPARE APPLICATION
+    # PREPARE
     # ========================================================
 
     def prepare_application(
@@ -93,20 +90,6 @@ class ApplicationPipeline:
         resume_path: str,
         fields: Dict[str, str],
     ) -> Dict:
-        """
-        Prepare an application.
-
-        This:
-
-        1. Checks the resume exists.
-        2. Discovers the application form.
-        3. Fills application fields.
-        4. Uploads the resume.
-        5. Validates the form.
-
-        It does NOT click the final submit button.
-        """
-
         resume_file = Path(resume_path)
 
         if not resume_file.exists():
@@ -133,7 +116,7 @@ class ApplicationPipeline:
         return result
 
     # ========================================================
-    # SUBMIT APPLICATION
+    # SUBMIT
     # ========================================================
 
     def submit_application(
@@ -142,11 +125,17 @@ class ApplicationPipeline:
         job_id: str,
         confirm: bool = False,
     ) -> Dict:
-        """
-        Submit a prepared application.
+        if not job_id:
+            raise ValueError(
+                "job_id cannot be empty."
+            )
 
-        Final submission requires explicit confirmation.
-        """
+        if self.job_store.get_job(job_id) is None:
+            return {
+                "success": False,
+                "status": "job_not_found",
+                "job_id": job_id,
+            }
 
         submitter = ApplicationSubmitter(page)
 
@@ -155,7 +144,6 @@ class ApplicationPipeline:
         )
 
         if result.get("success"):
-
             self.job_store.update_status(
                 job_id,
                 "applied",
@@ -167,14 +155,18 @@ class ApplicationPipeline:
             )
 
         elif result.get("status") == "confirmation_required":
+            self.job_store.update_status(
+                job_id,
+                "application_started",
+            )
 
+        elif result.get("status") == "not_ready":
             self.job_store.update_status(
                 job_id,
                 "application_started",
             )
 
         else:
-
             self.job_store.update_status(
                 job_id,
                 "application_failed",
@@ -185,10 +177,13 @@ class ApplicationPipeline:
                 status="application_failed",
             )
 
-        return result
+        return {
+            **result,
+            "job_id": job_id,
+        }
 
     # ========================================================
-    # UPDATE APPLICATION STATUS
+    # STATUS
     # ========================================================
 
     def update_application_status(
@@ -197,17 +192,9 @@ class ApplicationPipeline:
         status: str,
         details: Optional[Dict] = None,
     ) -> bool:
-        """
-        Update the current status of an application.
 
-        Examples:
-
-            shortlisted
-            rejected
-            interview
-            assessment
-            walk_in
-        """
+        if self.job_store.get_job(job_id) is None:
+            return False
 
         updated = self.job_store.update_status(
             job_id,
@@ -225,18 +212,10 @@ class ApplicationPipeline:
 
         return True
 
-    # ========================================================
-    # GET APPLICATION STATUS
-    # ========================================================
-
     def get_application_status(
         self,
         job_id: str,
     ) -> Optional[str]:
-        """
-        Return the current application status.
-        """
-
         return self.job_store.get_status(
             job_id,
         )
@@ -250,33 +229,38 @@ class ApplicationPipeline:
         resume: Dict,
         job: Dict,
     ) -> Dict:
-        """
-        Evaluate a job before starting an application.
-
-        This does NOT submit anything.
-        """
-
         match_result = self.evaluate_job(
             resume=resume,
             job=job,
         )
 
         return {
-            "eligible": match_result["eligible"],
-            "match_score": match_result["match_score"],
-            "recommendation": match_result[
-                "recommendation"
-            ],
-            "matched_required_skills": match_result[
-                "matched_required_skills"
-            ],
-            "missing_required_skills": match_result[
-                "missing_required_skills"
-            ],
-            "matched_preferred_skills": match_result[
-                "matched_preferred_skills"
-            ],
-            "missing_preferred_skills": match_result[
-                "missing_preferred_skills"
-            ],
+            "eligible": match_result.get(
+                "eligible",
+                False,
+            ),
+            "match_score": match_result.get(
+                "match_score",
+                0,
+            ),
+            "recommendation": match_result.get(
+                "recommendation",
+                "",
+            ),
+            "matched_required_skills": match_result.get(
+                "matched_required_skills",
+                [],
+            ),
+            "missing_required_skills": match_result.get(
+                "missing_required_skills",
+                [],
+            ),
+            "matched_preferred_skills": match_result.get(
+                "matched_preferred_skills",
+                [],
+            ),
+            "missing_preferred_skills": match_result.get(
+                "missing_preferred_skills",
+                [],
+            ),
         }

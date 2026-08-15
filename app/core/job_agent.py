@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
 
-from app.core.application_workflow import (
-    ApplicationWorkflow,
-)
-from app.core.job_match_pipeline import match_job
+from app.core.application_workflow import ApplicationWorkflow
+from app.core.job_match_pipeline import JobMatchPipeline
+from app.core.job_match_pipeline import JobMatchPipeline
+from app.core.job_match_pipeline import JobMatchPipeline
+from app.core.matcher import match_job
 from app.jobs.job_store import JobStore
 from app.outreach.outreach_pipeline import (
     OutreachPipeline,
@@ -15,27 +16,23 @@ from app.outreach.outreach_pipeline import (
 
 class JobAgent:
     """
-    Main coordinator for JobAgent.
+    Main high-level JobAgent coordinator.
 
-    Connects the major stages:
+    Responsibilities:
 
-        Jobs
-          ↓
+        Discovery
+            ↓
+        Storage
+            ↓
         Matching
-          ↓
+            ↓
         Selection
-          ↓
-        Application preparation
-          ↓
-        Application submission
-          ↓
+            ↓
+        Application
+            ↓
         Outreach
-          ↓
+            ↓
         Tracking
-
-    Website-specific browser logic remains outside this class.
-
-    Outreach sending always requires explicit confirmation.
     """
 
     def __init__(
@@ -47,7 +44,11 @@ class JobAgent:
         outreach_pipeline: Optional[
             OutreachPipeline
         ] = None,
+        job_match_pipeline: Optional[
+            JobMatchPipeline
+        ] = None,
     ):
+
         self.job_store = (
             job_store
             if job_store is not None
@@ -66,6 +67,10 @@ class JobAgent:
             else OutreachPipeline()
         )
 
+        self.job_match_pipeline = (
+            job_match_pipeline
+        )
+
     # ========================================================
     # JOB STORAGE
     # ========================================================
@@ -75,11 +80,11 @@ class JobAgent:
         job: Dict,
         status: str = "discovered",
     ) -> str:
-        """
-        Store a job.
-        """
 
-        if not isinstance(job, dict):
+        if not isinstance(
+            job,
+            dict,
+        ):
             raise TypeError(
                 "job must be a dictionary."
             )
@@ -93,22 +98,64 @@ class JobAgent:
         self,
         job_id: str,
     ) -> Optional[Dict]:
-        """
-        Retrieve one stored job.
-        """
 
         return self.job_store.get_job(
             job_id
         )
 
-    def get_jobs(
-        self,
-    ) -> List[Dict]:
-        """
-        Return all stored jobs.
-        """
+    def get_jobs(self) -> List[Dict]:
 
         return self.job_store.get_all_jobs()
+
+    # ========================================================
+    # DISCOVERY
+    # ========================================================
+
+    def discover_jobs(
+        self,
+        board_url: str,
+        keywords: str,
+        location: Optional[str] = None,
+    ) -> list[dict]:
+
+        if self.job_match_pipeline is None:
+            raise RuntimeError(
+                "JobMatchPipeline is not configured."
+            )
+
+        pipeline = self.job_match_pipeline.job_pipeline
+
+        jobs = pipeline.discover_greenhouse_jobs(
+            board_url=board_url,
+            keywords=keywords,
+            location=location,
+        )
+
+        return list(
+            jobs or []
+        )
+
+    def discover_and_store(
+        self,
+        board_url: str,
+        keywords: str,
+        location: Optional[str] = None,
+    ) -> list[str]:
+
+        jobs = self.discover_jobs(
+            board_url=board_url,
+            keywords=keywords,
+            location=location,
+        )
+
+        return [
+            self.add_job(
+                job,
+                status="discovered",
+            )
+            for job in jobs
+            if isinstance(job, dict)
+        ]
 
     # ========================================================
     # MATCHING
@@ -119,9 +166,6 @@ class JobAgent:
         resume: Dict,
         job: Dict,
     ) -> Dict:
-        """
-        Match a resume against a job.
-        """
 
         return match_job(
             resume,
@@ -133,11 +177,6 @@ class JobAgent:
         resume: Dict,
         job_id: str,
     ) -> Dict:
-        """
-        Match a stored job against a resume.
-
-        The stored job is marked as matched.
-        """
 
         job = self.get_job(
             job_id
@@ -153,26 +192,26 @@ class JobAgent:
             job,
         )
 
-        self.job_store.update_status(
-            job_id,
-            "matched",
-        )
+        if result.get("eligible"):
+            self.job_store.update_status(
+                job_id,
+                "matched",
+            )
 
         return result
 
     # ========================================================
-    # JOB SELECTION
+    # SELECTION
     # ========================================================
 
     def select_job(
         self,
         job_id: str,
     ) -> bool:
-        """
-        Mark a job as selected.
-        """
 
-        if self.get_job(job_id) is None:
+        if self.get_job(
+            job_id
+        ) is None:
             return False
 
         return self.job_store.update_status(
@@ -192,11 +231,6 @@ class JobAgent:
         fields: Dict[str, str],
         resume_output_path: str,
     ) -> Dict:
-        """
-        Prepare an application.
-
-        Nothing is submitted automatically.
-        """
 
         job = self.get_job(
             job_id
@@ -220,9 +254,7 @@ class JobAgent:
                     resume=resume,
                     job=job,
                     fields=fields,
-                    resume_output_path=(
-                        resume_output_path
-                    ),
+                    resume_output_path=resume_output_path,
                 )
             )
 
@@ -234,7 +266,7 @@ class JobAgent:
             raise
 
     # ========================================================
-    # APPLICATION SUBMISSION
+    # SUBMISSION
     # ========================================================
 
     def submit_application(
@@ -243,23 +275,17 @@ class JobAgent:
         prepared_application: Dict,
         confirm: bool = False,
     ) -> Dict:
-        """
-        Submit a prepared application.
 
-        Explicit confirmation is required by the
-        application workflow.
-        """
-
-        if self.get_job(job_id) is None:
+        if self.get_job(
+            job_id
+        ) is None:
             raise ValueError(
                 f"Job not found: {job_id}"
             )
 
-        result = (
-            self.application_workflow.submit(
-                prepared_application,
-                confirm=confirm,
-            )
+        result = self.application_workflow.submit(
+            prepared_application,
+            confirm=confirm,
         )
 
         if result.get("success"):
@@ -268,15 +294,37 @@ class JobAgent:
                 "applied",
             )
 
-        elif result.get("status") == (
-            "validation_failed"
-        ):
+        elif result.get("status") == "validation_failed":
             self.job_store.update_status(
                 job_id,
                 "application_failed",
             )
 
         return result
+
+    # ========================================================
+    # STATUS
+    # ========================================================
+
+    def update_application_status(
+        self,
+        job_id: str,
+        status: str,
+    ) -> bool:
+
+        return self.job_store.update_status(
+            job_id,
+            status,
+        )
+
+    def get_application_status(
+        self,
+        job_id: str,
+    ) -> Optional[str]:
+
+        return self.job_store.get_status(
+            job_id
+        )
 
     # ========================================================
     # OUTREACH
@@ -289,11 +337,6 @@ class JobAgent:
         candidate: Optional[Dict] = None,
         resume_path: Optional[str] = None,
     ) -> OutreachResult:
-        """
-        Prepare outreach for a stored job.
-
-        No email is sent.
-        """
 
         job = self.get_job(
             job_id
@@ -304,18 +347,10 @@ class JobAgent:
                 f"Job not found: {job_id}"
             )
 
-        if candidate is None:
-            candidate = {}
-
-        if not isinstance(candidate, dict):
-            raise TypeError(
-                "candidate must be a dictionary."
-            )
-
         return self.outreach_pipeline.prepare_outreach(
             contacts=contacts,
             job=job,
-            candidate=candidate,
+            candidate=candidate or {},
             resume_path=resume_path,
         )
 
@@ -327,11 +362,6 @@ class JobAgent:
         resume_path: Optional[str] = None,
         confirm: bool = False,
     ) -> OutreachResult:
-        """
-        Send outreach for a stored job.
-
-        Explicit confirmation is required.
-        """
 
         job = self.get_job(
             job_id
@@ -342,54 +372,16 @@ class JobAgent:
                 f"Job not found: {job_id}"
             )
 
-        if candidate is None:
-            candidate = {}
-
-        if not isinstance(candidate, dict):
-            raise TypeError(
-                "candidate must be a dictionary."
-            )
-
         return self.outreach_pipeline.send_outreach(
             contacts=contacts,
             job=job,
-            candidate=candidate,
+            candidate=candidate or {},
             resume_path=resume_path,
             confirm=confirm,
         )
 
     # ========================================================
-    # APPLICATION STATUS
-    # ========================================================
-
-    def update_application_status(
-        self,
-        job_id: str,
-        status: str,
-    ) -> bool:
-        """
-        Update application status.
-        """
-
-        return self.job_store.update_status(
-            job_id,
-            status,
-        )
-
-    def get_application_status(
-        self,
-        job_id: str,
-    ) -> Optional[str]:
-        """
-        Return current application status.
-        """
-
-        return self.job_store.get_status(
-            job_id
-        )
-
-    # ========================================================
-    # PROCESS JOB
+    # PROCESS
     # ========================================================
 
     def process_job(
@@ -397,9 +389,6 @@ class JobAgent:
         resume: Dict,
         job_id: str,
     ) -> Dict:
-        """
-        Run matching for one stored job.
-        """
 
         job = self.get_job(
             job_id
