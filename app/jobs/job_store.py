@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 from typing import Optional
@@ -11,7 +13,20 @@ class JobStore:
     application lifecycle.
 
     Storage format:
+
         data/jobs/jobs.json
+
+    Job IDs are stable:
+
+        URL
+            ↓
+        preferred identifier
+
+    If no URL exists:
+
+        company + title
+            ↓
+        fallback identifier
     """
 
     VALID_STATUSES = {
@@ -33,7 +48,9 @@ class JobStore:
         self,
         storage_path: str = "data/jobs/jobs.json",
     ):
-        self.storage_path = Path(storage_path)
+        self.storage_path = Path(
+            storage_path
+        )
 
         self.storage_path.parent.mkdir(
             parents=True,
@@ -47,8 +64,17 @@ class JobStore:
     # ========================================================
 
     def _load(self) -> dict:
+        """
+        Load jobs from persistent JSON storage.
+
+        Corrupt or unreadable storage is treated as empty
+        storage rather than crashing initialization.
+        """
+
         if not self.storage_path.exists():
-            return {"jobs": {}}
+            return {
+                "jobs": {}
+            }
 
         try:
             with open(
@@ -58,8 +84,13 @@ class JobStore:
             ) as file:
                 data = json.load(file)
 
-            if not isinstance(data, dict):
-                return {"jobs": {}}
+            if not isinstance(
+                data,
+                dict,
+            ):
+                return {
+                    "jobs": {}
+                }
 
             if not isinstance(
                 data.get("jobs"),
@@ -73,11 +104,22 @@ class JobStore:
             json.JSONDecodeError,
             OSError,
         ):
-            return {"jobs": {}}
+            return {
+                "jobs": {}
+            }
 
     def _save(self) -> None:
-        temporary_path = self.storage_path.with_suffix(
-            ".tmp"
+        """
+        Persist current data atomically.
+
+        Data is first written to a temporary file and then
+        replaced into the final storage path.
+        """
+
+        temporary_path = (
+            self.storage_path.with_suffix(
+                ".tmp"
+            )
         )
 
         with open(
@@ -85,6 +127,7 @@ class JobStore:
             "w",
             encoding="utf-8",
         ) as file:
+
             json.dump(
                 self._data,
                 file,
@@ -101,29 +144,70 @@ class JobStore:
     # ========================================================
 
     @staticmethod
-    def _job_id(job: Job | dict) -> str:
+    def _job_id(
+        job: Job | dict,
+    ) -> str:
         """
         Generate a stable identifier.
 
-        URL is preferred because it normally uniquely identifies
-        a job posting.
+        URL is preferred because it normally uniquely
+        identifies a job posting.
+
+        If no URL exists, company + title are used.
         """
 
-        if isinstance(job, Job):
+        if isinstance(
+            job,
+            Job,
+        ):
             url = job.url
             title = job.title
             company = job.company
+
+        elif isinstance(
+            job,
+            dict,
+        ):
+            url = job.get(
+                "url",
+                "",
+            )
+
+            title = job.get(
+                "title",
+                "",
+            )
+
+            company = job.get(
+                "company",
+                "",
+            )
+
         else:
-            url = job.get("url", "")
-            title = job.get("title", "")
-            company = job.get("company", "")
+            raise TypeError(
+                "job must be a Job or dictionary."
+            )
+
+        # Safely normalize values even when a scraper
+        # returns None.
+        url = str(
+            url or ""
+        ).strip()
+
+        title = str(
+            title or ""
+        ).strip()
+
+        company = str(
+            company or ""
+        ).strip()
 
         if url:
-            return url.strip()
+            return url
 
         return (
-            f"{company.strip()}|"
-            f"{title.strip()}"
+            f"{company}|"
+            f"{title}"
         ).lower()
 
     # ========================================================
@@ -138,6 +222,10 @@ class JobStore:
         """
         Add a job if it doesn't already exist.
 
+        Existing job records are updated with newly supplied
+        job fields while preserving their existing lifecycle
+        status.
+
         Returns:
             Stable job ID.
         """
@@ -147,7 +235,9 @@ class JobStore:
                 f"Invalid job status: {status}"
             )
 
-        job_id = self._job_id(job)
+        job_id = self._job_id(
+            job
+        )
 
         if not job_id:
             raise ValueError(
@@ -155,14 +245,22 @@ class JobStore:
                 "title/company combination."
             )
 
-        if isinstance(job, Job):
+        if isinstance(
+            job,
+            Job,
+        ):
             job_data = job.to_dict()
-        else:
-            job_data = dict(job)
 
-        existing = self._data["jobs"].get(
-            job_id,
-            {},
+        else:
+            job_data = dict(
+                job
+            )
+
+        existing = (
+            self._data["jobs"].get(
+                job_id,
+                {},
+            )
         )
 
         record = {
@@ -175,7 +273,9 @@ class JobStore:
             ),
         }
 
-        self._data["jobs"][job_id] = record
+        self._data["jobs"][job_id] = (
+            record
+        )
 
         self._save()
 
@@ -197,7 +297,9 @@ class JobStore:
             job_id
         )
 
-    def get_all_jobs(self) -> list[dict]:
+    def get_all_jobs(
+        self,
+    ) -> list[dict]:
         """
         Return every stored job.
         """
@@ -218,7 +320,8 @@ class JobStore:
         """
         Update application status.
 
-        Returns False if the job does not exist.
+        Returns:
+            False if the job does not exist.
         """
 
         if status not in self.VALID_STATUSES:
@@ -226,7 +329,9 @@ class JobStore:
                 f"Invalid job status: {status}"
             )
 
-        job = self.get_job(job_id)
+        job = self.get_job(
+            job_id
+        )
 
         if job is None:
             return False
@@ -245,12 +350,16 @@ class JobStore:
         Return current status of a job.
         """
 
-        job = self.get_job(job_id)
+        job = self.get_job(
+            job_id
+        )
 
         if job is None:
             return None
 
-        return job.get("status")
+        return job.get(
+            "status"
+        )
 
     # ========================================================
     # DUPLICATE CHECK
@@ -264,7 +373,10 @@ class JobStore:
         Check whether a job already exists.
         """
 
-        return job_id in self._data["jobs"]
+        return (
+            job_id
+            in self._data["jobs"]
+        )
 
     # ========================================================
     # FILTER BY STATUS
@@ -286,14 +398,18 @@ class JobStore:
         return [
             job
             for job in self.get_all_jobs()
-            if job.get("status") == status
+            if job.get(
+                "status"
+            ) == status
         ]
 
     # ========================================================
     # COUNT
     # ========================================================
 
-    def count(self) -> int:
+    def count(
+        self,
+    ) -> int:
         """
         Return total number of stored jobs.
         """
