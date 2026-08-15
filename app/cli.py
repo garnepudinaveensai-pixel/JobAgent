@@ -1,22 +1,29 @@
+from __future__ import annotations
+
 import argparse
 from typing import Optional
 
 from app.config import create_default_config
+from app.core.agent_runner import AgentRunner
 from app.jobs.job_store import JobStore
 
 
 # ============================================================
-# CONFIGURATION
+# PARSER
 # ============================================================
+
 
 def build_parser() -> argparse.ArgumentParser:
     """
-    Build the command-line interface parser.
+    Build the JobAgent command-line interface.
     """
 
     parser = argparse.ArgumentParser(
         prog="jobagent",
-        description="JobAgent - automated job search and application assistant.",
+        description=(
+            "JobAgent - automated job search and "
+            "application assistant."
+        ),
     )
 
     subparsers = parser.add_subparsers(
@@ -24,9 +31,9 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # CONFIG
-    # --------------------------------------------------------
+    # ========================================================
 
     config_parser = subparsers.add_parser(
         "config",
@@ -37,9 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
         handler=handle_config,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # JOBS
-    # --------------------------------------------------------
+    # ========================================================
 
     jobs_parser = subparsers.add_parser(
         "jobs",
@@ -58,9 +65,57 @@ def build_parser() -> argparse.ArgumentParser:
         handler=handle_jobs_list,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
+    # DISCOVER
+    # ========================================================
+
+    discover_parser = subparsers.add_parser(
+        "discover",
+        help="Discover and match jobs from a Greenhouse board.",
+    )
+
+    discover_parser.add_argument(
+        "--board-url",
+        required=True,
+        help=(
+            "Greenhouse board URL. "
+            "Example: https://boards.greenhouse.io/company"
+        ),
+    )
+
+    discover_parser.add_argument(
+        "--keywords",
+        required=True,
+        help=(
+            "Job search keywords. "
+            "Example: electrical engineer"
+        ),
+    )
+
+    discover_parser.add_argument(
+        "--location",
+        default=None,
+        help=(
+            "Optional job location. "
+            "Example: Hyderabad"
+        ),
+    )
+
+    discover_parser.add_argument(
+        "--store",
+        action="store_true",
+        help=(
+            "Store discovered jobs in the JobAgent database."
+        ),
+    )
+
+    discover_parser.set_defaults(
+        handler=handle_discover,
+    )
+
+    # ========================================================
     # STATUS
-    # --------------------------------------------------------
+    # ========================================================
 
     status_parser = subparsers.add_parser(
         "status",
@@ -82,12 +137,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # ============================================================
-# COMMAND HANDLERS
+# CONFIG HANDLER
 # ============================================================
+
 
 def handle_config(args) -> int:
     """
-    Display current configuration.
+    Display current JobAgent configuration.
     """
 
     config = create_default_config()
@@ -138,6 +194,11 @@ def handle_config(args) -> int:
     return 0
 
 
+# ============================================================
+# JOB LIST HANDLER
+# ============================================================
+
+
 def handle_jobs_list(args) -> int:
     """
     Display stored jobs.
@@ -175,6 +236,204 @@ def handle_jobs_list(args) -> int:
     return 0
 
 
+# ============================================================
+# DISCOVERY HANDLER
+# ============================================================
+
+
+def handle_discover(args) -> int:
+    """
+    Discover jobs from a Greenhouse board and match them
+    against the available resumes.
+
+    By default this only discovers and displays results.
+
+    If --store is supplied, discovered jobs are also persisted
+    in the JobAgent job database.
+    """
+
+    print("=" * 60)
+    print("JobAgent Job Discovery")
+    print("=" * 60)
+
+    print(
+        f"Board URL: {args.board_url}"
+    )
+
+    print(
+        f"Keywords: {args.keywords}"
+    )
+
+    print(
+        f"Location: "
+        f"{args.location or '(any)'}"
+    )
+
+    print()
+
+    print(
+        "Starting browser and discovering jobs..."
+    )
+
+    try:
+        runner = AgentRunner()
+
+        results = runner.discover_and_match(
+            board_url=args.board_url,
+            keywords=args.keywords,
+            location=args.location,
+        )
+
+    except Exception as exc:
+        print()
+        print(
+            f"Discovery failed: {exc}"
+        )
+        return 1
+
+    print()
+
+    if not results:
+        print(
+            "No matching jobs were found."
+        )
+        return 0
+
+    print(
+        f"Jobs discovered and matched: "
+        f"{len(results)}"
+    )
+
+    print()
+
+    # --------------------------------------------------------
+    # Display results
+    # --------------------------------------------------------
+
+    for index, result in enumerate(
+        results,
+        start=1,
+    ):
+        job = result.get(
+            "job",
+            {},
+        )
+
+        resume = result.get(
+            "resume",
+            {},
+        )
+
+        match = result.get(
+            "match",
+            {},
+        )
+
+        title = job.get(
+            "title",
+            "",
+        )
+
+        company = job.get(
+            "company",
+            "",
+        )
+
+        location = job.get(
+            "location",
+            "",
+        )
+
+        url = job.get(
+            "url",
+            "",
+        )
+
+        score = match.get(
+            "match_score",
+            0,
+        )
+
+        eligible = match.get(
+            "eligible",
+            False,
+        )
+
+        resume_filename = resume.get(
+            "filename",
+            "",
+        )
+
+        print(
+            f"{index}. {title}"
+        )
+
+        print(
+            f"   Company: {company}"
+        )
+
+        print(
+            f"   Location: {location}"
+        )
+
+        print(
+            f"   Match score: {score}"
+        )
+
+        print(
+            f"   Eligible: {eligible}"
+        )
+
+        print(
+            f"   Resume: {resume_filename}"
+        )
+
+        if url:
+            print(
+                f"   URL: {url}"
+            )
+
+        print()
+
+    # --------------------------------------------------------
+    # Optional storage
+    # --------------------------------------------------------
+
+    if args.store:
+        print(
+            "Storing discovered jobs..."
+        )
+
+        runner = AgentRunner()
+
+        jobs = [
+            result.get(
+                "job",
+                {},
+            )
+            for result in results
+            if isinstance(
+                result.get("job"),
+                dict,
+            )
+        ]
+
+        job_ids = runner.store_jobs(
+            jobs
+        )
+
+        print(
+            f"Stored jobs: {len(job_ids)}"
+        )
+
+    return 0
+
+
+# ============================================================
+# STATUS HANDLER
+# ============================================================
+
+
 def handle_status(args) -> int:
     """
     Display application statuses.
@@ -190,7 +449,9 @@ def handle_status(args) -> int:
         jobs = store.get_all_jobs()
 
     if not jobs:
-        print("No applications found.")
+        print(
+            "No applications found."
+        )
         return 0
 
     for index, job in enumerate(
@@ -224,6 +485,7 @@ def handle_status(args) -> int:
 # MAIN
 # ============================================================
 
+
 def main(
     argv: Optional[list[str]] = None,
 ) -> int:
@@ -233,7 +495,9 @@ def main(
 
     parser = build_parser()
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(
+        argv
+    )
 
     handler = getattr(
         args,
@@ -245,7 +509,14 @@ def main(
         parser.print_help()
         return 1
 
-    return handler(args)
+    return handler(
+        args
+    )
+
+
+# ============================================================
+# PYTHON ENTRY POINT
+# ============================================================
 
 
 if __name__ == "__main__":
