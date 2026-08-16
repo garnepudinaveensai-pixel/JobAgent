@@ -9,6 +9,7 @@ from app.config import (
 from app.core.application_pipeline import ApplicationPipeline
 from app.core.job_deduplicator import JobDeduplicator
 from app.core.job_match_pipeline import JobMatchPipeline
+from app.core.job_ranker import JobRanker
 from app.core.sources.job_source_manager import JobSourceManager
 from app.jobs.job_store import JobStore
 from app.outreach.outreach_pipeline import OutreachResult
@@ -18,7 +19,7 @@ class AgentRunner:
     """
     High-level orchestration layer for JobAgent.
 
-    Pipeline:
+    Main pipeline:
 
         Discovery
             ↓
@@ -29,6 +30,8 @@ class AgentRunner:
         Storage
             ↓
         Matching
+            ↓
+        Ranking
             ↓
         Selection
             ↓
@@ -108,16 +111,25 @@ class AgentRunner:
     # SOURCES
     # ========================================================
 
-    def add_source(self, source) -> None:
+    def add_source(
+        self,
+        source,
+    ) -> None:
         """
         Register a job source.
         """
-        self.job_source_manager.add_source(source)
 
-    def get_sources(self) -> list:
+        self.job_source_manager.add_source(
+            source
+        )
+
+    def get_sources(
+        self,
+    ) -> list:
         """
         Return registered job sources.
         """
+
         return self.job_source_manager.get_sources()
 
     # ========================================================
@@ -128,6 +140,11 @@ class AgentRunner:
         self,
         jobs: Iterable[dict],
     ) -> list[str]:
+        """
+        Store discovered jobs.
+
+        Invalid jobs are skipped.
+        """
 
         if jobs is None:
             return []
@@ -136,7 +153,10 @@ class AgentRunner:
 
         for job in jobs:
 
-            if not isinstance(job, dict):
+            if not isinstance(
+                job,
+                dict,
+            ):
                 continue
 
             try:
@@ -151,7 +171,9 @@ class AgentRunner:
             ):
                 continue
 
-            job_ids.append(job_id)
+            job_ids.append(
+                job_id
+            )
 
         return job_ids
 
@@ -163,10 +185,16 @@ class AgentRunner:
         self,
         status: Optional[str] = None,
     ) -> list[dict]:
+        """
+        Return all jobs or jobs matching a status.
+        """
 
         if status is not None:
-            return self.job_store.get_jobs_by_status(
-                status
+            return (
+                self.job_store
+                .get_jobs_by_status(
+                    status
+                )
             )
 
         return self.job_store.get_all_jobs()
@@ -175,6 +203,9 @@ class AgentRunner:
         self,
         job_id: str,
     ) -> Optional[dict]:
+        """
+        Return a single stored job.
+        """
 
         return self.job_store.get_job(
             job_id
@@ -185,6 +216,9 @@ class AgentRunner:
         job_id: str,
         status: str,
     ) -> bool:
+        """
+        Update the status of a stored job.
+        """
 
         return self.job_store.update_status(
             job_id,
@@ -205,8 +239,6 @@ class AgentRunner:
         Discover jobs from every registered source.
 
         Results are deduplicated before being returned.
-
-        Source-specific options are forwarded to each source.
         """
 
         if not keywords or not keywords.strip():
@@ -214,15 +246,21 @@ class AgentRunner:
                 "keywords cannot be empty."
             )
 
-        jobs = self.job_source_manager.search(
-            keywords=keywords.strip(),
-            location=location,
-            **source_options,
+        jobs = (
+            self.job_source_manager.search(
+                keywords=keywords.strip(),
+                location=location,
+                **source_options,
+            )
         )
 
         return self.deduplicator.deduplicate(
             jobs
         )
+
+    # ========================================================
+    # MULTI-SOURCE DISCOVERY + MATCHING
+    # ========================================================
 
     def discover_and_match_from_sources(
         self,
@@ -239,20 +277,6 @@ class AgentRunner:
         through JobSourceManager.
 
         Requires JobMatchPipeline to be configured.
-
-        Flow:
-
-            JobSourceManager
-                    ↓
-            Multi-source discovery
-                    ↓
-            JobDeduplicator
-                    ↓
-            JobMatchPipeline
-                    ↓
-            JobParser
-                    ↓
-            Resume Selection
         """
 
         if not keywords or not keywords.strip():
@@ -277,6 +301,152 @@ class AgentRunner:
         return self.job_match_pipeline.match_jobs(
             jobs
         )
+
+    # ========================================================
+    # MULTI-SOURCE DISCOVERY + MATCHING + RANKING
+    # ========================================================
+
+    def discover_match_and_rank_from_sources(
+        self,
+        keywords: str,
+        location: Optional[str] = None,
+        *,
+        min_score: float = 0.0,
+        eligible_only: bool = False,
+        limit: Optional[int] = None,
+        **source_options,
+    ) -> list[dict]:
+        """
+        Complete multi-source job intelligence pipeline.
+
+        Flow:
+
+            JobSourceManager
+                    ↓
+            Multi-source discovery
+                    ↓
+            JobDeduplicator
+                    ↓
+            JobMatchPipeline
+                    ↓
+            Resume Selection
+                    ↓
+            JobRanker
+                    ↓
+            Filtered + ranked jobs
+
+        Args:
+            keywords:
+                Search keywords.
+
+            location:
+                Optional job location.
+
+            min_score:
+                Minimum final ranking score from 0 to 100.
+
+            eligible_only:
+                When True, only results explicitly marked
+                eligible=True are returned.
+
+            limit:
+                Optional maximum number of results.
+
+            **source_options:
+                Source-specific discovery options.
+
+        Returns:
+            Ranked and filtered job-match results.
+        """
+
+        if not keywords or not keywords.strip():
+            raise ValueError(
+                "keywords cannot be empty."
+            )
+
+        if min_score < 0:
+            raise ValueError(
+                "min_score cannot be negative."
+            )
+
+        if min_score > 100:
+            raise ValueError(
+                "min_score cannot exceed 100."
+            )
+
+        if limit is not None and limit < 0:
+            raise ValueError(
+                "limit cannot be negative."
+            )
+
+        if self.job_match_pipeline is None:
+            raise RuntimeError(
+                "JobMatchPipeline is not configured."
+            )
+
+        # ----------------------------------------------------
+        # DISCOVERY + DEDUPLICATION
+        # ----------------------------------------------------
+
+        jobs = self.discover_from_sources(
+            keywords=keywords.strip(),
+            location=location,
+            **source_options,
+        )
+
+        if not jobs:
+            return []
+
+        # ----------------------------------------------------
+        # RESUME MATCHING
+        # ----------------------------------------------------
+
+        matched_results = (
+            self.job_match_pipeline.match_jobs(
+                jobs
+            )
+        )
+
+        if not matched_results:
+            return []
+
+        # ----------------------------------------------------
+        # RANKING + FILTERING
+        # ----------------------------------------------------
+
+        return JobRanker.filter_and_rank(
+            matched_results,
+            min_score=min_score,
+            eligible_only=eligible_only,
+            limit=limit,
+        )
+
+    # ========================================================
+    # RANK EXISTING MATCH RESULTS
+    # ========================================================
+
+    @staticmethod
+    def rank_match_results(
+        results: Optional[list[dict]],
+        *,
+        min_score: float = 0.0,
+        eligible_only: bool = False,
+        limit: Optional[int] = None,
+    ) -> list[dict]:
+        """
+        Rank already-matched job results.
+
+        This allows callers to reuse the ranking engine without
+        running discovery or resume matching again.
+        """
+
+        return JobRanker.filter_and_rank(
+            results,
+            min_score=min_score,
+            eligible_only=eligible_only,
+            limit=limit,
+        )
+
     # ========================================================
     # SOURCE DISCOVERY + STORE
     # ========================================================
@@ -316,7 +486,7 @@ class AgentRunner:
         Backward-compatible Greenhouse discovery API.
 
         Existing callers can continue using this method while
-        the new multi-source API is introduced.
+        the multi-source API is used by newer code.
         """
 
         # Preferred modern pipeline.
@@ -383,6 +553,9 @@ class AgentRunner:
         keywords: str,
         location: Optional[str] = None,
     ) -> list[str]:
+        """
+        Legacy Greenhouse discovery followed by storage.
+        """
 
         jobs = self.discover_jobs(
             board_url=board_url,
@@ -408,6 +581,9 @@ class AgentRunner:
         keywords: str,
         location: Optional[str] = None,
     ) -> list[dict]:
+        """
+        Legacy Greenhouse discovery + matching.
+        """
 
         if self.job_match_pipeline is None:
             raise RuntimeError(
@@ -436,6 +612,9 @@ class AgentRunner:
         resume: dict,
         job_id: str,
     ) -> dict:
+        """
+        Match one stored job against one resume.
+        """
 
         job = self.get_job(
             job_id
@@ -470,6 +649,9 @@ class AgentRunner:
         self,
         job_id: str,
     ) -> bool:
+        """
+        Mark a stored job as selected.
+        """
 
         job = self.get_job(
             job_id
@@ -487,6 +669,9 @@ class AgentRunner:
         self,
         results: Iterable[dict],
     ) -> list[str]:
+        """
+        Select all eligible jobs from match results.
+        """
 
         selected: list[str] = []
 
@@ -567,6 +752,9 @@ class AgentRunner:
         resume_path: str,
         fields: dict,
     ) -> dict:
+        """
+        Prepare an application without submitting it.
+        """
 
         job = self.get_job(
             job_id
@@ -597,6 +785,11 @@ class AgentRunner:
         job_id: str,
         confirm: bool = False,
     ) -> dict:
+        """
+        Submit an application.
+
+        Submission requires explicit confirmation.
+        """
 
         return (
             self.application_pipeline
@@ -617,6 +810,9 @@ class AgentRunner:
         status: str,
         details: Optional[dict] = None,
     ) -> bool:
+        """
+        Update application status.
+        """
 
         return (
             self.application_pipeline
@@ -631,6 +827,9 @@ class AgentRunner:
         self,
         job_id: str,
     ) -> Optional[str]:
+        """
+        Return current application status.
+        """
 
         return (
             self.application_pipeline
@@ -650,6 +849,9 @@ class AgentRunner:
         candidate: Optional[dict] = None,
         resume_path: Optional[str] = None,
     ) -> OutreachResult:
+        """
+        Prepare outreach without sending it.
+        """
 
         if self.job_agent is None:
             raise RuntimeError(
@@ -671,6 +873,9 @@ class AgentRunner:
         resume_path: Optional[str] = None,
         confirm: bool = False,
     ) -> OutreachResult:
+        """
+        Send outreach after explicit confirmation.
+        """
 
         if self.job_agent is None:
             raise RuntimeError(
@@ -690,6 +895,9 @@ class AgentRunner:
     # ========================================================
 
     def summary(self) -> dict:
+        """
+        Return a summary of stored jobs by status.
+        """
 
         jobs = self.job_store.get_all_jobs()
 
