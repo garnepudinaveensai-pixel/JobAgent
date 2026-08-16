@@ -1,53 +1,89 @@
-from app.parser.job_parser import parse_job_description
+from app.core.job_parser import (
+    extract_experience_requirements,
+    extract_skills,
+    parse_job,
+)
 
 
-def test_parse_job_description():
-
-    job_description = """
-    Job Title: Graduate Engineer Trainee
-
-    Requirements:
-    - B.Tech in Electrical Engineering
-    - Python
-    - C
-    - MATLAB
-    - Industrial Automation
-    - Power Electronics
-    - TI C2000
-
-    Preferred Skills:
-    - Predictive Maintenance
-    - Vibration Analysis
-
-    Experience:
-    0-1 years of experience
+def test_extract_skills():
+    text = """
+    We are looking for an Electrical Engineer
+    with Python, MATLAB, Simulink and
+    predictive maintenance experience.
     """
 
-    job = parse_job_description(job_description)
+    skills = extract_skills(text)
 
-    assert job["job_title"]
+    assert "Python" in skills
+    assert "MATLAB" in skills
+    assert "Simulink" in skills
+    assert "Predictive Maintenance" in skills
 
-    assert job["degree_requirements"]
 
-    assert "Python" in job["required_skills"]
+def test_extract_experience():
+    job = {
+        "title": "Electrical Engineer",
+        "description": (
+            "Requires 2+ years of experience "
+            "in electrical maintenance."
+        ),
+    }
 
-    assert "C" in job["required_skills"]
+    result = extract_experience_requirements(
+        job
+    )
 
-    assert "MATLAB" in job["required_skills"]
+    assert "2+ years of experience" in result
 
-    assert "Industrial Automation" in job["required_skills"]
 
-    assert "Power Electronics" in job["required_skills"]
+def test_parse_job_preserves_fields():
+    job = {
+        "title": "Electrical Engineer",
+        "company": "Example",
+        "location": "Hyderabad",
+        "url": "https://example.com/job",
+        "description": (
+            "Requires Python and MATLAB."
+        ),
+    }
 
-    assert "TI C2000" in job["required_skills"]
+    result = parse_job(job)
 
-    assert "Predictive Maintenance" in job["preferred_skills"]
+    assert result["title"] == (
+        "Electrical Engineer"
+    )
 
-    assert "Vibration Analysis" in job["preferred_skills"]
+    assert result["company"] == (
+        "Example"
+    )
 
-    assert job["experience_requirements"]
+    assert "Python" in result["all_keywords"]
+    assert "MATLAB" in result["all_keywords"]
 
-    assert job["all_keywords"]
 
-    print("\nParsed Job Description:")
-    print(job)
+def test_parse_job_preserves_existing_skills():
+    job = {
+        "title": "Automation Engineer",
+        "description": "PLC automation role.",
+        "required_skills": [
+            "PLC",
+        ],
+        "preferred_skills": [
+            "SCADA",
+        ],
+    }
+
+    result = parse_job(job)
+
+    assert result["required_skills"] == [
+        "PLC"
+    ]
+
+    assert result["preferred_skills"] == [
+        "SCADA"
+    ]
+
+
+def test_parse_invalid_job():
+    assert parse_job(None) == {}
+    assert parse_job("invalid") == {}
