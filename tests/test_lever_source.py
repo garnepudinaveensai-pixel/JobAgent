@@ -253,3 +253,21 @@ def test_lever_source_unavailable_without_browser():
     source = LeverSource()
 
     assert source.is_available() is False
+
+def test_lever_supported_options():
+
+    source = LeverSource(
+        browser=MagicMock()
+    )
+
+    assert source.get_supported_options() == {
+        "board_url"
+    }
+
+    assert source.supports_option(
+        "board_url"
+    )
+
+    assert not source.supports_option(
+        "career_url"
+    )

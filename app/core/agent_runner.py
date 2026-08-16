@@ -7,7 +7,9 @@ from app.config import (
     create_default_config,
 )
 from app.core.application_pipeline import ApplicationPipeline
+from app.core.job_deduplicator import JobDeduplicator
 from app.core.job_match_pipeline import JobMatchPipeline
+from app.core.sources.job_source_manager import JobSourceManager
 from app.jobs.job_store import JobStore
 from app.outreach.outreach_pipeline import OutreachResult
 
@@ -19,6 +21,10 @@ class AgentRunner:
     Pipeline:
 
         Discovery
+            ↓
+        Multi-source aggregation
+            ↓
+        Deduplication
             ↓
         Storage
             ↓
@@ -36,8 +42,8 @@ class AgentRunner:
             ↓
         Email status / notification
 
-    Browser automation is delegated to the appropriate
-    browser/pipeline components.
+    Browser automation and source-specific access are delegated
+    to their respective components.
     """
 
     def __init__(
@@ -46,6 +52,8 @@ class AgentRunner:
         job_store: Optional[JobStore] = None,
         job_match_pipeline: Optional[JobMatchPipeline] = None,
         application_pipeline: Optional[ApplicationPipeline] = None,
+        job_source_manager: Optional[JobSourceManager] = None,
+        deduplicator: Optional[JobDeduplicator] = None,
         job_agent=None,
     ):
         self.config = (
@@ -66,7 +74,18 @@ class AgentRunner:
             job_match_pipeline
         )
 
-        # Shared JobStore is critical.
+        self.job_source_manager = (
+            job_source_manager
+            if job_source_manager is not None
+            else JobSourceManager()
+        )
+
+        self.deduplicator = (
+            deduplicator
+            if deduplicator is not None
+            else JobDeduplicator()
+        )
+
         self.application_pipeline = (
             application_pipeline
             if application_pipeline is not None
@@ -75,7 +94,7 @@ class AgentRunner:
             )
         )
 
-        # Backward compatibility.
+        # Backward compatibility with the older JobAgent API.
         self.job_agent = job_agent
 
     # ========================================================
@@ -84,6 +103,22 @@ class AgentRunner:
 
     def validate_config(self) -> None:
         self.config.validate()
+
+    # ========================================================
+    # SOURCES
+    # ========================================================
+
+    def add_source(self, source) -> None:
+        """
+        Register a job source.
+        """
+        self.job_source_manager.add_source(source)
+
+    def get_sources(self) -> list:
+        """
+        Return registered job sources.
+        """
+        return self.job_source_manager.get_sources()
 
     # ========================================================
     # STORAGE
@@ -97,7 +132,7 @@ class AgentRunner:
         if jobs is None:
             return []
 
-        job_ids = []
+        job_ids: list[str] = []
 
         for job in jobs:
 
@@ -114,8 +149,6 @@ class AgentRunner:
                 TypeError,
                 ValueError,
             ):
-                # One malformed job must not destroy
-                # an entire discovery batch.
                 continue
 
             job_ids.append(job_id)
@@ -159,7 +192,65 @@ class AgentRunner:
         )
 
     # ========================================================
-    # DISCOVERY
+    # MULTI-SOURCE DISCOVERY
+    # ========================================================
+
+    def discover_from_sources(
+        self,
+        keywords: str,
+        location: Optional[str] = None,
+        **source_options,
+    ) -> list[dict]:
+        """
+        Discover jobs from every registered source.
+
+        Results are deduplicated before being returned.
+
+        Source-specific options are forwarded to each source.
+        """
+
+        if not keywords or not keywords.strip():
+            raise ValueError(
+                "keywords cannot be empty."
+            )
+
+        jobs = self.job_source_manager.search(
+            keywords=keywords.strip(),
+            location=location,
+            **source_options,
+        )
+
+        return self.deduplicator.deduplicate(
+            jobs
+        )
+
+    # ========================================================
+    # SOURCE DISCOVERY + STORE
+    # ========================================================
+
+    def discover_from_sources_and_store(
+        self,
+        keywords: str,
+        location: Optional[str] = None,
+        **source_options,
+    ) -> list[str]:
+        """
+        Discover from all registered sources,
+        deduplicate, then store.
+        """
+
+        jobs = self.discover_from_sources(
+            keywords=keywords,
+            location=location,
+            **source_options,
+        )
+
+        return self.store_jobs(
+            jobs
+        )
+
+    # ========================================================
+    # LEGACY DISCOVERY
     # ========================================================
 
     def discover_jobs(
@@ -168,6 +259,12 @@ class AgentRunner:
         keywords: str,
         location: Optional[str] = None,
     ) -> list[dict]:
+        """
+        Backward-compatible Greenhouse discovery API.
+
+        Existing callers can continue using this method while
+        the new multi-source API is introduced.
+        """
 
         # Preferred modern pipeline.
         if self.job_match_pipeline is not None:
@@ -179,6 +276,7 @@ class AgentRunner:
             )
 
             if method is not None:
+
                 discover = getattr(
                     method,
                     "discover_greenhouse_jobs",
@@ -186,6 +284,7 @@ class AgentRunner:
                 )
 
                 if callable(discover):
+
                     jobs = discover(
                         board_url=board_url,
                         keywords=keywords,
@@ -206,6 +305,7 @@ class AgentRunner:
             )
 
             if callable(discover):
+
                 jobs = discover(
                     board_url=board_url,
                     keywords=keywords,
@@ -221,7 +321,7 @@ class AgentRunner:
         )
 
     # ========================================================
-    # DISCOVER + STORE
+    # LEGACY DISCOVER + STORE
     # ========================================================
 
     def discover_and_store(
@@ -237,12 +337,16 @@ class AgentRunner:
             location=location,
         )
 
+        jobs = self.deduplicator.deduplicate(
+            jobs
+        )
+
         return self.store_jobs(
             jobs
         )
 
     # ========================================================
-    # DISCOVER + MATCH
+    # LEGACY DISCOVER + MATCH
     # ========================================================
 
     def discover_and_match(
@@ -289,9 +393,12 @@ class AgentRunner:
                 f"Job not found: {job_id}"
             )
 
-        result = self.application_pipeline.evaluate_job(
-            resume=resume,
-            job=job,
+        result = (
+            self.application_pipeline
+            .evaluate_job(
+                resume=resume,
+                job=job,
+            )
         )
 
         if result.get("eligible"):
@@ -328,7 +435,7 @@ class AgentRunner:
         results: Iterable[dict],
     ) -> list[str]:
 
-        selected = []
+        selected: list[str] = []
 
         for result in results:
 
@@ -366,22 +473,25 @@ class AgentRunner:
             ):
                 continue
 
-            job_id = job.get(
-                "job_id"
-            ) or job.get(
-                "url"
+            job_id = (
+                job.get("job_id")
+                or job.get("url")
             )
 
             if not job_id:
                 continue
 
-            # Ensure job exists first.
             if self.job_store.get_job(
                 job_id
             ) is None:
+
                 self.job_store.add_job(
                     job,
                     status="matched",
+                )
+
+                job_id = self.job_store._job_id(
+                    job
                 )
 
             if self.select_job(
@@ -414,11 +524,14 @@ class AgentRunner:
                 f"Job not found: {job_id}"
             )
 
-        return self.application_pipeline.prepare_application(
-            page=page,
-            job=job,
-            resume_path=resume_path,
-            fields=fields,
+        return (
+            self.application_pipeline
+            .prepare_application(
+                page=page,
+                job=job,
+                resume_path=resume_path,
+                fields=fields,
+            )
         )
 
     # ========================================================
@@ -432,10 +545,13 @@ class AgentRunner:
         confirm: bool = False,
     ) -> dict:
 
-        return self.application_pipeline.submit_application(
-            page=page,
-            job_id=job_id,
-            confirm=confirm,
+        return (
+            self.application_pipeline
+            .submit_application(
+                page=page,
+                job_id=job_id,
+                confirm=confirm,
+            )
         )
 
     # ========================================================
@@ -449,10 +565,13 @@ class AgentRunner:
         details: Optional[dict] = None,
     ) -> bool:
 
-        return self.application_pipeline.update_application_status(
-            job_id=job_id,
-            status=status,
-            details=details,
+        return (
+            self.application_pipeline
+            .update_application_status(
+                job_id=job_id,
+                status=status,
+                details=details,
+            )
         )
 
     def get_application_status(
@@ -460,8 +579,11 @@ class AgentRunner:
         job_id: str,
     ) -> Optional[str]:
 
-        return self.application_pipeline.get_application_status(
-            job_id
+        return (
+            self.application_pipeline
+            .get_application_status(
+                job_id
+            )
         )
 
     # ========================================================

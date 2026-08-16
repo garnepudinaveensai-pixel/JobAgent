@@ -51,6 +51,14 @@ def create_runner(
             ↓
         BrowserManager
             ↓
+        ┌──────────────────────────────┐
+        │                              │
+        │       JobSourceManager       │
+        │       /            \\         │
+        │ Greenhouse        Lever      │
+        │                              │
+        └──────────────────────────────┘
+            ↓
         ResumeManager
             ↓
         JobMatchPipeline
@@ -114,6 +122,39 @@ def create_runner(
     )
 
     # --------------------------------------------------------
+    # Multi-source job discovery
+    # --------------------------------------------------------
+
+    from app.core.sources.job_source_manager import (
+        JobSourceManager,
+    )
+
+    from app.core.sources.greenhouse_source import (
+        GreenhouseSource,
+    )
+
+    from app.core.sources.lever_source import (
+        LeverSource,
+    )
+
+    # Create the source manager.
+    source_manager = JobSourceManager()
+
+    # Register Greenhouse.
+    source_manager.add_source(
+        GreenhouseSource(
+            browser=browser,
+        )
+    )
+
+    # Register Lever.
+    source_manager.add_source(
+        LeverSource(
+            browser=browser,
+        )
+    )
+
+    # --------------------------------------------------------
     # Job discovery + matching pipeline
     # --------------------------------------------------------
 
@@ -132,6 +173,7 @@ def create_runner(
         config=config,
         job_store=job_store,
         job_match_pipeline=job_match_pipeline,
+        job_source_manager=source_manager,
     )
 
 

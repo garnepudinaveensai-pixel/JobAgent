@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from app.core.sources.job_source import JobSource
 
@@ -9,15 +9,31 @@ class JobSourceManager:
     """
     Coordinates job discovery across multiple sources.
 
-    Each source is responsible for its own access method.
-    The manager combines their results into one list.
+    Responsibilities:
+
+        Source availability
+            ↓
+        Source-specific options
+            ↓
+        Source search
+            ↓
+        Result validation
+            ↓
+        Common-field normalization
+            ↓
+        Combined results
+
+    Deduplication is intentionally handled outside this
+    manager by the orchestration layer.
     """
 
     def __init__(
         self,
         sources: Optional[list[JobSource]] = None,
     ):
-        self.sources = sources or []
+        self.sources = list(
+            sources or []
+        )
 
     # ========================================================
     # SOURCE MANAGEMENT
@@ -29,6 +45,8 @@ class JobSourceManager:
     ) -> None:
         """
         Register a job source.
+
+        The same source instance is not registered twice.
         """
 
         if source not in self.sources:
@@ -36,14 +54,43 @@ class JobSourceManager:
                 source
             )
 
-    def get_sources(self) -> list[JobSource]:
+    def get_sources(
+        self,
+    ) -> list[JobSource]:
         """
-        Return all registered sources.
+        Return a copy of registered sources.
         """
 
         return list(
             self.sources
         )
+
+    # ========================================================
+    # OPTION HANDLING
+    # ========================================================
+
+    @staticmethod
+    def _get_source_options(
+        source: JobSource,
+        options: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Select only options explicitly supported by a source.
+        """
+
+        if not options:
+            return {}
+
+        supported = source.get_supported_options()
+
+        if not supported:
+            return {}
+
+        return {
+            key: value
+            for key, value in options.items()
+            if key in supported
+        }
 
     # ========================================================
     # SEARCH
@@ -53,16 +100,20 @@ class JobSourceManager:
         self,
         keywords: str,
         location: Optional[str] = None,
-        **source_options,
+        **source_options: Any,
     ) -> list[dict]:
         """
-        Search every registered source.
+        Search all registered sources.
 
-        source_options contains source-specific options.
+        Common parameters:
 
-        Example:
+            keywords
+            location
 
-            board_url="https://boards.greenhouse.io/company"
+        Source-specific parameters are sent only to sources
+        that explicitly declare support for them.
+
+        Deduplication is handled by the orchestration layer.
         """
 
         if not keywords or not keywords.strip():
@@ -74,28 +125,56 @@ class JobSourceManager:
 
         for source in self.sources:
 
-            if not source.is_available():
-                continue
+            # ------------------------------------------------
+            # AVAILABILITY
+            # ------------------------------------------------
 
             try:
+                if not source.is_available():
+                    continue
 
+            except Exception as exc:
+                print(
+                    f"Warning: {source.name} "
+                    f"availability check failed: {exc}"
+                )
+                continue
+
+            # ------------------------------------------------
+            # SOURCE OPTIONS
+            # ------------------------------------------------
+
+            options = (
+                self._get_source_options(
+                    source,
+                    source_options,
+                )
+            )
+
+            # ------------------------------------------------
+            # SEARCH
+            # ------------------------------------------------
+
+            try:
                 jobs = source.search(
-                    keywords=keywords,
+                    keywords=keywords.strip(),
                     location=location,
-                    **source_options,
+                    **options,
                 )
 
             except Exception as exc:
-
                 print(
                     f"Warning: {source.name} "
                     f"source failed: {exc}"
                 )
-
                 continue
 
             if jobs is None:
                 continue
+
+            # ------------------------------------------------
+            # NORMALIZATION
+            # ------------------------------------------------
 
             for job in jobs:
 
@@ -113,6 +192,22 @@ class JobSourceManager:
                     "source",
                     source.name,
                 )
+
+                for field in (
+                    "title",
+                    "company",
+                    "location",
+                    "url",
+                    "description",
+                ):
+                    value = normalized.get(
+                        field,
+                        "",
+                    )
+
+                    normalized[field] = str(
+                        value or ""
+                    ).strip()
 
                 results.append(
                     normalized

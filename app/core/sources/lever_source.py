@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from app.browser.browser_manager import BrowserManager
 from app.browser.job_discovery import JobDiscovery
@@ -9,152 +9,108 @@ from app.core.sources.job_source import JobSource
 
 class LeverSource(JobSource):
     """
-    Lever job source.
+    Lever public job-board source.
 
-    Uses publicly accessible Lever job-board functionality
-    through the existing browser discovery layer.
+    Supported source-specific option:
 
-    This source does NOT:
-    - bypass authentication
-    - bypass anti-bot controls
-    - bypass access restrictions
-    - bypass CAPTCHAs
-    - submit applications
+        board_url
 
-    Application submission remains a separate pipeline.
+    This source does not bypass authentication, CAPTCHAs,
+    anti-bot controls, or other access restrictions.
     """
 
     name = "lever"
+
+    SUPPORTED_OPTIONS = {
+        "board_url",
+    }
 
     def __init__(
         self,
         browser: Optional[BrowserManager] = None,
     ):
-        """
-        Create a Lever source.
-
-        The browser is optional during construction so that
-        configuration and validation can be performed before
-        an actual browser is required.
-        """
-
         self.browser = browser
 
-        self.discovery: Optional[
-            JobDiscovery
-        ] = None
+        self.discovery = None
 
         if browser is not None:
             self.discovery = JobDiscovery(
                 browser
             )
 
-    # ========================================================
-    # SEARCH
-    # ========================================================
+    def supports_option(
+        self,
+        option: str,
+    ) -> bool:
+        return option in self.SUPPORTED_OPTIONS
+
+    def get_supported_options(
+        self,
+    ) -> set[str]:
+        return set(
+            self.SUPPORTED_OPTIONS
+        )
 
     def search(
         self,
         keywords: str,
         location: Optional[str] = None,
-        board_url: Optional[str] = None,
+        **options: Any,
     ) -> list[dict]:
         """
-        Search a publicly accessible Lever job board.
-
-        Args:
-            keywords:
-                Job search keywords.
-
-            location:
-                Optional location filter.
-
-            board_url:
-                Public Lever job-board URL.
-
-        Returns:
-            Normalized job dictionaries.
-
-        Raises:
-            ValueError:
-                If keywords or board_url are empty.
-
-            RuntimeError:
-                If no browser has been configured.
+        Search a public Lever job board.
         """
-
-        # ----------------------------------------------------
-        # Validate keywords
-        # ----------------------------------------------------
 
         if not keywords or not keywords.strip():
             raise ValueError(
                 "Lever keywords cannot be empty."
             )
 
-        # ----------------------------------------------------
-        # Validate board URL
-        # ----------------------------------------------------
+        board_url = options.get(
+            "board_url"
+        )
 
-        if not board_url or not board_url.strip():
+        if not board_url or not str(
+            board_url
+        ).strip():
             raise ValueError(
                 "Lever board_url cannot be empty."
             )
-
-        # ----------------------------------------------------
-        # Validate browser
-        # ----------------------------------------------------
 
         if self.browser is None:
             raise RuntimeError(
                 "LeverSource requires a browser."
             )
 
-        # ----------------------------------------------------
-        # Ensure discovery exists
-        # ----------------------------------------------------
-
         if self.discovery is None:
             self.discovery = JobDiscovery(
                 self.browser
             )
 
-        # ----------------------------------------------------
-        # Discover jobs
-        # ----------------------------------------------------
-
         jobs = self.discovery.discover_lever(
-            board_url=board_url.strip(),
+            board_url=str(
+                board_url
+            ).strip(),
             keywords=keywords.strip(),
             location=location,
         )
-
-        # ----------------------------------------------------
-        # Normalize results
-        # ----------------------------------------------------
 
         return self._normalize_jobs(
             jobs
         )
 
-    # ========================================================
-    # NORMALIZATION
-    # ========================================================
-
-    @staticmethod
     def _normalize_jobs(
-        jobs: list[dict],
+        self,
+        jobs: Any,
     ) -> list[dict]:
         """
-        Normalize jobs returned by Lever discovery.
-
-        Every valid job receives the common JobAgent schema.
+        Normalize Lever results.
         """
 
-        normalized: list[dict] = []
-
         if jobs is None:
-            return normalized
+            return []
+
+        normalized: list[dict] = []
 
         for job in jobs:
 
@@ -171,6 +127,7 @@ class LeverSource(JobSource):
                             "title",
                             "",
                         )
+                        or ""
                     ).strip(),
 
                     "company": str(
@@ -178,6 +135,7 @@ class LeverSource(JobSource):
                             "company",
                             "",
                         )
+                        or ""
                     ).strip(),
 
                     "location": str(
@@ -185,6 +143,7 @@ class LeverSource(JobSource):
                             "location",
                             "",
                         )
+                        or ""
                     ).strip(),
 
                     "url": str(
@@ -192,6 +151,7 @@ class LeverSource(JobSource):
                             "url",
                             "",
                         )
+                        or ""
                     ).strip(),
 
                     "description": str(
@@ -199,26 +159,18 @@ class LeverSource(JobSource):
                             "description",
                             "",
                         )
+                        or ""
                     ).strip(),
 
-                    "source": "lever",
+                    "source": self.name,
                 }
             )
 
         return normalized
 
-    # ========================================================
-    # AVAILABILITY
-    # ========================================================
-
     def is_available(self) -> bool:
         """
-        Return whether the Lever source has a browser
-        configured.
-
-        This does not claim that the remote Lever site is
-        reachable. Actual site availability is determined
-        during discovery.
+        Lever is available when a browser is configured.
         """
 
         return self.browser is not None

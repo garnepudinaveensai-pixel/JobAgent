@@ -110,3 +110,21 @@ def test_greenhouse_source_ignores_invalid_jobs():
     assert jobs[0]["source"] == (
         "greenhouse"
     )
+
+def test_greenhouse_supported_options():
+
+    source = GreenhouseSource(
+        browser=MagicMock()
+    )
+
+    assert source.get_supported_options() == {
+        "board_url"
+    }
+
+    assert source.supports_option(
+        "board_url"
+    )
+
+    assert not source.supports_option(
+        "career_url"
+    )
