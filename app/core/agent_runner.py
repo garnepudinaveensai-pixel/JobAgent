@@ -224,6 +224,59 @@ class AgentRunner:
             jobs
         )
 
+    def discover_and_match_from_sources(
+        self,
+        keywords: str,
+        location: Optional[str] = None,
+        **source_options,
+    ) -> list[dict]:
+        """
+        Discover jobs from all registered sources,
+        deduplicate them, and match each job against
+        the available resumes.
+
+        Source-specific discovery options are forwarded
+        through JobSourceManager.
+
+        Requires JobMatchPipeline to be configured.
+
+        Flow:
+
+            JobSourceManager
+                    ↓
+            Multi-source discovery
+                    ↓
+            JobDeduplicator
+                    ↓
+            JobMatchPipeline
+                    ↓
+            JobParser
+                    ↓
+            Resume Selection
+        """
+
+        if not keywords or not keywords.strip():
+            raise ValueError(
+                "keywords cannot be empty."
+            )
+
+        if self.job_match_pipeline is None:
+            raise RuntimeError(
+                "JobMatchPipeline is not configured."
+            )
+
+        jobs = self.discover_from_sources(
+            keywords=keywords.strip(),
+            location=location,
+            **source_options,
+        )
+
+        if not jobs:
+            return []
+
+        return self.job_match_pipeline.match_jobs(
+            jobs
+        )
     # ========================================================
     # SOURCE DISCOVERY + STORE
     # ========================================================
