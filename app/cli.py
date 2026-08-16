@@ -83,6 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
             "greenhouse",
             "lever",
             "workday",
+            "indeed",
+            "naukri",
         ],
         default="greenhouse",
         help=(
@@ -307,9 +309,7 @@ def handle_discover(args) -> int:
         )
 
         # Keep only jobs belonging to the requested
-        # source. This allows the same source manager
-        # to remain multi-source while this command
-        # targets one source.
+        # source.
         results = [
             job
             for job in results

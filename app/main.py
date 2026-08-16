@@ -22,13 +22,6 @@ from app.jobs.job_store import JobStore
 def load_config() -> JobAgentConfig:
     """
     Load the default JobAgent configuration.
-
-    This can later be extended to support:
-        - environment variables
-        - .env files
-        - JSON configuration
-        - YAML configuration
-        - user-specific configuration
     """
 
     return create_default_config()
@@ -51,44 +44,19 @@ def create_runner(
             ↓
         BrowserManager
             ↓
-        ┌──────────────────────────────┐
-        │                              │
-        │       JobSourceManager       │
-        │       /            \\         │
-        │ Greenhouse        Lever      │
-        │                              │
-        └──────────────────────────────┘
+        JobSourceManager
+        /       |       |       |       \
+    Greenhouse Lever  Workday  Indeed  Naukri
             ↓
         ResumeManager
             ↓
         JobMatchPipeline
             ↓
         AgentRunner
-
-    The same JobStore instance is shared with AgentRunner.
-
-    IMPORTANT:
-        This function intentionally does NOT call
-        config.validate().
-
-        Tests and programmatic callers may create a default
-        JobAgentConfig with notifications enabled but without
-        an email address.
-
-        Runtime validation is performed by main() after the
-        runtime-safe configuration has been prepared.
     """
-
-    # --------------------------------------------------------
-    # Load configuration
-    # --------------------------------------------------------
 
     if config is None:
         config = load_config()
-
-    # --------------------------------------------------------
-    # Prepare required directories
-    # --------------------------------------------------------
 
     config.ensure_directories()
 
@@ -141,30 +109,65 @@ def create_runner(
         WorkdaySource,
     )
 
-    # Create the source manager.
+    from app.core.sources.indeed_source import (
+        IndeedSource,
+    )
+
+    from app.core.sources.naukri_source import (
+        NaukriSource,
+    )
+
     source_manager = JobSourceManager()
 
-    # Register Greenhouse.
+    # --------------------------------------------------------
+    # Greenhouse
+    # --------------------------------------------------------
+
     source_manager.add_source(
         GreenhouseSource(
             browser=browser,
         )
     )
 
-    # Register Lever.
+    # --------------------------------------------------------
+    # Lever
+    # --------------------------------------------------------
+
     source_manager.add_source(
         LeverSource(
             browser=browser,
         )
     )
 
-    # Register Workday.
+    # --------------------------------------------------------
+    # Workday
+    # --------------------------------------------------------
+
     source_manager.add_source(
         WorkdaySource(
             browser=browser,
         )
     )
 
+    # --------------------------------------------------------
+    # Indeed
+    # --------------------------------------------------------
+
+    source_manager.add_source(
+        IndeedSource(
+            browser=browser,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Naukri
+    # --------------------------------------------------------
+
+    source_manager.add_source(
+        NaukriSource(
+            browser=browser,
+        )
+    )
 
     # --------------------------------------------------------
     # Job discovery + matching pipeline
@@ -196,11 +199,7 @@ def create_runner(
 
 def load_settings() -> dict:
     """
-    Backward-compatible loader for the old settings.json
-    format.
-
-    Returns an empty dictionary when the legacy settings file
-    does not exist.
+    Backward-compatible loader for the old settings.json format.
     """
 
     settings_path = Path(
@@ -245,8 +244,6 @@ def _prepare_runtime_config(
     If notifications are enabled but no notification email
     is configured, notifications are disabled only for this
     runtime session.
-
-    The original configuration object is not modified.
     """
 
     runtime_config = copy.deepcopy(
@@ -407,15 +404,7 @@ def main(
 
     Without arguments:
         Perform safe startup and configuration check.
-
-    Returns:
-        0 on success.
-        1 on startup/configuration failure.
     """
-
-    # --------------------------------------------------------
-    # Resolve command-line arguments
-    # --------------------------------------------------------
 
     if argv is None:
         argv = sys.argv[1:]
@@ -434,33 +423,24 @@ def main(
     # --------------------------------------------------------
 
     try:
-        # Load original configuration.
         config = load_config()
 
-        # Create a safe runtime copy.
         runtime_config = _prepare_runtime_config(
             config
         )
 
-        # Validate ONLY the runtime configuration.
         runtime_config.validate()
 
-        # Create the fully wired runner.
         runner = create_runner(
-            config=runtime_config
+            config=runtime_config,
         )
 
-        # Display startup information.
         _print_startup_summary(
             config=runtime_config,
             runner=runner,
         )
 
         return 0
-
-    # --------------------------------------------------------
-    # CONFIGURATION ERRORS
-    # --------------------------------------------------------
 
     except ValueError as exc:
 
@@ -469,10 +449,6 @@ def main(
         )
 
         return 1
-
-    # --------------------------------------------------------
-    # UNEXPECTED ERRORS
-    # --------------------------------------------------------
 
     except Exception as exc:
 
