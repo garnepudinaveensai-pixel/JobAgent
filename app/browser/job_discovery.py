@@ -5,7 +5,7 @@ from typing import Optional
 from app.browser.browser_manager import BrowserManager
 from app.browser.sites.greenhouse import GreenhouseSite
 from app.browser.sites.lever import LeverSite
-
+from app.browser.sites.workday import WorkdaySite
 
 class JobDiscovery:
     """
@@ -207,6 +207,100 @@ class JobDiscovery:
             job_url.strip()
         )
 
+    # ========================================================
+    # WORKDAY
+    # ========================================================
+
+    def discover_workday(
+        self,
+        board_url: str,
+        keywords: str,
+        location: Optional[str] = None,
+    ) -> list[dict]:
+        """
+        Discover jobs from a publicly accessible Workday
+        external career site.
+
+        Only normal public career-site functionality is used.
+        """
+
+        self._validate_search_inputs(
+            board_url=board_url,
+            keywords=keywords,
+        )
+
+        page = self.browser.open(
+            board_url.strip()
+        )
+
+        site = WorkdaySite(
+            page
+        )
+
+        site.search_jobs(
+            keywords=keywords.strip(),
+            location=location,
+        )
+
+        jobs = site.get_job_listings()
+
+        jobs = self._normalize_discovered_jobs(
+            jobs
+        )
+
+        if location and location.strip():
+            requested_location = (
+                location.strip().lower()
+            )
+
+            filtered: list[dict] = []
+
+            for job in jobs:
+                job_location = str(
+                    job.get(
+                        "location",
+                        "",
+                    )
+                ).lower()
+
+                if (
+                    not job_location
+                    or requested_location
+                    in job_location
+                ):
+                    filtered.append(
+                        job
+                    )
+
+            return filtered
+
+        return jobs
+
+    def get_workday_job_details(
+        self,
+        job_url: str,
+    ) -> dict:
+        """
+        Get complete details for one publicly accessible
+        Workday job.
+        """
+
+        self._validate_job_url(
+            job_url
+        )
+
+        page = self.browser.open(
+            job_url.strip()
+        )
+
+        site = WorkdaySite(
+            page
+        )
+
+        return site.get_job_details(
+            job_url.strip()
+        )
+        
     # ========================================================
     # VALIDATION
     # ========================================================
