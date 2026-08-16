@@ -71,15 +71,33 @@ def build_parser() -> argparse.ArgumentParser:
 
     discover_parser = subparsers.add_parser(
         "discover",
-        help="Discover and match jobs from a Greenhouse board.",
+        help=(
+            "Discover and match jobs from a supported "
+            "job-board source."
+        ),
+    )
+
+    discover_parser.add_argument(
+        "--source",
+        choices=[
+            "greenhouse",
+            "lever",
+            "workday",
+        ],
+        default="greenhouse",
+        help=(
+            "Job source. "
+            "Default: greenhouse."
+        ),
     )
 
     discover_parser.add_argument(
         "--board-url",
         required=True,
         help=(
-            "Greenhouse board URL. "
-            "Example: https://boards.greenhouse.io/company"
+            "Public job-board URL. "
+            "Example: "
+            "https://boards.greenhouse.io/company"
         ),
     )
 
@@ -105,7 +123,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--store",
         action="store_true",
         help=(
-            "Store discovered jobs in the JobAgent database."
+            "Store discovered jobs in the "
+            "JobAgent database."
         ),
     )
 
@@ -243,18 +262,21 @@ def handle_jobs_list(args) -> int:
 
 def handle_discover(args) -> int:
     """
-    Discover jobs from a Greenhouse board and match them
-    against the available resumes.
+    Discover jobs from a selected supported source.
 
     By default this only discovers and displays results.
 
-    If --store is supplied, discovered jobs are also persisted
-    in the JobAgent job database.
+    If --store is supplied, discovered jobs are also
+    persisted in the JobAgent job database.
     """
 
     print("=" * 60)
     print("JobAgent Job Discovery")
     print("=" * 60)
+
+    print(
+        f"Source: {args.source}"
+    )
 
     print(
         f"Board URL: {args.board_url}"
@@ -278,11 +300,21 @@ def handle_discover(args) -> int:
     try:
         runner = create_runner()
 
-        results = runner.discover_and_match(
-            board_url=args.board_url,
+        results = runner.discover_from_sources(
             keywords=args.keywords,
             location=args.location,
+            board_url=args.board_url,
         )
+
+        # Keep only jobs belonging to the requested
+        # source. This allows the same source manager
+        # to remain multi-source while this command
+        # targets one source.
+        results = [
+            job
+            for job in results
+            if job.get("source") == args.source
+        ]
 
     except Exception as exc:
         print()
@@ -300,7 +332,7 @@ def handle_discover(args) -> int:
         return 0
 
     print(
-        f"Jobs discovered and matched: "
+        f"Jobs discovered: "
         f"{len(results)}"
     )
 
@@ -310,25 +342,10 @@ def handle_discover(args) -> int:
     # Display results
     # --------------------------------------------------------
 
-    for index, result in enumerate(
+    for index, job in enumerate(
         results,
         start=1,
     ):
-        job = result.get(
-            "job",
-            {},
-        )
-
-        resume = result.get(
-            "resume",
-            {},
-        )
-
-        match = result.get(
-            "match",
-            {},
-        )
-
         title = job.get(
             "title",
             "",
@@ -349,18 +366,8 @@ def handle_discover(args) -> int:
             "",
         )
 
-        score = match.get(
-            "match_score",
-            0,
-        )
-
-        eligible = match.get(
-            "eligible",
-            False,
-        )
-
-        resume_filename = resume.get(
-            "filename",
+        description = job.get(
+            "description",
             "",
         )
 
@@ -377,20 +384,18 @@ def handle_discover(args) -> int:
         )
 
         print(
-            f"   Match score: {score}"
-        )
-
-        print(
-            f"   Eligible: {eligible}"
-        )
-
-        print(
-            f"   Resume: {resume_filename}"
+            f"   Source: {job.get('source', '')}"
         )
 
         if url:
             print(
                 f"   URL: {url}"
+            )
+
+        if description:
+            print(
+                f"   Description: "
+                f"{description[:200]}"
             )
 
         print()
@@ -406,24 +411,13 @@ def handle_discover(args) -> int:
 
         runner = create_runner()
 
-        jobs = [
-            result.get(
-                "job",
-                {},
-            )
-            for result in results
-            if isinstance(
-                result.get("job"),
-                dict,
-            )
-        ]
-
         job_ids = runner.store_jobs(
-            jobs
+            results
         )
 
         print(
-            f"Stored jobs: {len(job_ids)}"
+            f"Stored jobs: "
+            f"{len(job_ids)}"
         )
 
     return 0

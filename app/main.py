@@ -137,6 +137,10 @@ def create_runner(
         LeverSource,
     )
 
+    from app.core.sources.workday_source import (
+        WorkdaySource,
+    )
+
     # Create the source manager.
     source_manager = JobSourceManager()
 
@@ -153,6 +157,14 @@ def create_runner(
             browser=browser,
         )
     )
+
+    # Register Workday.
+    source_manager.add_source(
+        WorkdaySource(
+            browser=browser,
+        )
+    )
+
 
     # --------------------------------------------------------
     # Job discovery + matching pipeline
