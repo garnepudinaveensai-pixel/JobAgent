@@ -875,6 +875,33 @@ class EndToEndPipeline:
             ),
         )
 
+        safety_status = str(
+            result.get(
+                "status",
+                "",
+            )
+            or ""
+        ).strip()
+
+        human_action_statuses = {
+            "captcha_detected",
+            "login_required",
+            "human_action_required",
+        }
+
+        if safety_status in human_action_statuses:
+            result["requires_human_action"] = True
+
+        result.setdefault(
+            "requires_human_action",
+            bool(
+                result.get(
+                    "requires_human_action",
+                    False,
+                )
+            ),
+        )
+
         success = bool(
             result.get(
                 "success",
@@ -882,7 +909,36 @@ class EndToEndPipeline:
             )
         )
 
-        if success:
+        # Preserve structured browser safety states. A CAPTCHA,
+        # authentication barrier, unavailable job, or missing
+        # form is a known execution outcome, not an unexpected
+        # application failure.
+        safety_status = str(
+            result.get(
+                "status",
+                "",
+            )
+            or ""
+        ).strip()
+
+        safety_job_statuses = {
+            "captcha_detected": "captcha_detected",
+            "login_required": "login_required",
+            "human_action_required": "human_action_required",
+            "job_unavailable": "job_unavailable",
+            "form_not_found": "form_not_found",
+            "navigation_failed": "navigation_failed",
+            "validation_failed": "validation_failed",
+        }
+
+        if safety_status in safety_job_statuses:
+            self.runner.job_store.update_status(
+                job_id,
+                safety_job_statuses[
+                    safety_status
+                ],
+            )
+        elif success:
             self.runner.job_store.update_status(
                 job_id,
                 "application_started",
@@ -1121,14 +1177,40 @@ class EndToEndPipeline:
         )
 
         if job_id:
-            self.runner.job_store.update_status(
-                job_id,
-                (
-                    "applied"
-                    if submitted
-                    else "application_failed"
-                ),
-            )
+            submission_status = str(
+                output.get(
+                    "status",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            safety_statuses = {
+                "captcha_detected",
+                "login_required",
+                "human_action_required",
+                "job_unavailable",
+                "form_not_found",
+                "navigation_failed",
+                "validation_failed",
+                "submission_timeout",
+                "submission_failed",
+            }
+
+            if submission_status in safety_statuses:
+                self.runner.job_store.update_status(
+                    job_id,
+                    submission_status,
+                )
+            else:
+                self.runner.job_store.update_status(
+                    job_id,
+                    (
+                        "applied"
+                        if submitted
+                        else "application_failed"
+                    ),
+                )
 
         return output
 

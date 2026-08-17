@@ -154,6 +154,10 @@ class ApplicationWorkflow:
                 "filled_fields",
                 [],
             ),
+            "failed_fields": prepared.get(
+                "failed_fields",
+                [],
+            ),
             "resume_uploaded": prepared.get(
                 "resume_uploaded",
                 False,
@@ -165,6 +169,20 @@ class ApplicationWorkflow:
             "status": prepared.get(
                 "status",
                 "unknown",
+            ),
+            "message": prepared.get(
+                "message",
+                "",
+            ),
+            "page_analysis": prepared.get(
+                "page_analysis",
+                {},
+            ),
+            "requires_human_action": bool(
+                prepared.get(
+                    "requires_human_action",
+                    False,
+                )
             ),
             "success": prepared.get(
                 "success",
@@ -201,6 +219,52 @@ class ApplicationWorkflow:
                 "status": "not_prepared",
             }
 
+        safety_status = str(
+            prepared_application.get(
+                "status",
+                "",
+            )
+            or ""
+        ).strip()
+
+        human_action_statuses = {
+            "captcha_detected",
+            "login_required",
+            "human_action_required",
+        }
+
+        blocking_statuses = {
+            "job_unavailable",
+            "form_not_found",
+            "navigation_failed",
+            "validation_failed",
+            *human_action_statuses,
+        }
+
+        if safety_status in blocking_statuses:
+            return {
+                "success": False,
+                "status": safety_status,
+                "submitted": False,
+                "requires_human_action": (
+                    safety_status
+                    in human_action_statuses
+                    or bool(
+                        prepared_application.get(
+                            "requires_human_action",
+                            False,
+                        )
+                    )
+                ),
+                "page_analysis": dict(
+                    prepared_application.get(
+                        "page_analysis",
+                        {},
+                    )
+                    or {}
+                ),
+            }
+
         if not prepared_application.get(
             "validation",
             {},
@@ -211,6 +275,7 @@ class ApplicationWorkflow:
             return {
                 "success": False,
                 "status": "validation_failed",
+                "submitted": False,
             }
 
         return submitter.submit(

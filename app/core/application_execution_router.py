@@ -53,6 +53,8 @@ class ExecutionResult:
         default_factory=dict
     )
 
+    requires_human_action: bool = False
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "success": self.success,
@@ -78,6 +80,9 @@ class ExecutionResult:
             ),
             "error": self.error,
             "metadata": dict(self.metadata),
+            "requires_human_action": (
+                self.requires_human_action
+            ),
         }
 
 
@@ -202,7 +207,19 @@ class ApplicationExecutionRouter:
             ranked_result
         )
 
-        if decision.decision == APPLY:
+        # Normalize decision values at the router boundary.
+        #
+        # ApplicationDecisionEngine uses canonical uppercase
+        # constants (APPLY/OUTREACH/REVIEW/SKIP), while
+        # lightweight integrations and test doubles may return
+        # equivalent lowercase values. Treat decision values
+        # case-insensitively without weakening the explicit
+        # decision validation above.
+        decision_value = str(
+            getattr(decision, "decision", "")
+        ).strip().upper()
+
+        if decision_value == APPLY:
             return self._route_apply(
                 ranked_result=ranked_result,
                 decision=decision,
@@ -218,7 +235,7 @@ class ApplicationExecutionRouter:
                 dry_run=dry_run,
             )
 
-        if decision.decision == OUTREACH:
+        if decision_value == OUTREACH:
             return self._route_outreach(
                 ranked_result=ranked_result,
                 decision=decision,
@@ -230,7 +247,7 @@ class ApplicationExecutionRouter:
                 dry_run=dry_run,
             )
 
-        if decision.decision == REVIEW:
+        if decision_value == REVIEW:
             return self._route_review(
                 ranked_result=ranked_result,
                 decision=decision,
@@ -366,22 +383,70 @@ class ApplicationExecutionRouter:
             "success",
             False,
         ):
+            preparation_status = str(
+                prepared.get(
+                    "status",
+                    "application_prepare_failed",
+                )
+                or "application_prepare_failed"
+            )
+
+            # Preserve safety-critical browser states so they can
+            # propagate to the caller unchanged. Generic preparation
+            # failures retain the router's historical public status.
+            safety_statuses = {
+                "captcha_detected",
+                "login_required",
+                "human_action_required",
+                "job_unavailable",
+                "form_not_found",
+                "navigation_failed",
+                "submission_timeout",
+                "submission_failed",
+            }
+
+            if preparation_status not in safety_statuses:
+                preparation_status = (
+                    "application_prepare_failed"
+                )
+
+            requires_human_action = bool(
+                prepared.get(
+                    "requires_human_action",
+                    False,
+                )
+            )
+
+            if preparation_status in {
+                "captcha_detected",
+                "login_required",
+                "human_action_required",
+            }:
+                requires_human_action = True
+
             return ExecutionResult(
                 success=False,
                 decision=APPLY,
-                status="application_prepare_failed",
-                message=(
-                    "Application could not be prepared."
+                status=preparation_status,
+                message=str(
+                    prepared.get(
+                        "message",
+                        "Application could not be prepared.",
+                    )
                 ),
                 job=job,
                 ranking_score=ranking_score,
                 prepared=True,
                 result=dict(prepared),
-                error=str(
-                    prepared.get(
-                        "error",
-                        "Application preparation failed.",
+                error=(
+                    str(
+                        prepared.get("error")
                     )
+                    if prepared.get("error")
+                    else None
+                ),
+                requires_human_action=(
+                    requires_human_action
                 ),
             )
 
@@ -491,17 +556,31 @@ class ApplicationExecutionRouter:
             )
         )
 
+        submission_status = str(
+            submitted.get(
+                "status",
+                "applied"
+                if success
+                else "application_submit_failed",
+            )
+        )
+
+        requires_human_action = bool(
+            submitted.get(
+                "requires_human_action",
+                submission_status
+                in {
+                    "captcha_detected",
+                    "login_required",
+                    "human_action_required",
+                },
+            )
+        )
+
         return ExecutionResult(
             success=success,
             decision=APPLY,
-            status=str(
-                submitted.get(
-                    "status",
-                    "applied"
-                    if success
-                    else "application_submit_failed",
-                )
-            ),
+            status=submission_status,
             message=(
                 "Application submitted successfully."
                 if success
@@ -525,6 +604,9 @@ class ApplicationExecutionRouter:
                 )
                 if submitted.get("error")
                 else None
+            ),
+            requires_human_action=(
+                requires_human_action
             ),
         )
 

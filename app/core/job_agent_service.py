@@ -65,6 +65,8 @@ class JobAgentRunResult:
         default_factory=dict
     )
 
+    human_action_required_count: int = 0
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -883,6 +885,7 @@ class JobAgentService:
         executed_count = 0
         submitted_count = 0
         sent_count = 0
+        human_action_required_count = 0
 
         errors: list[
             dict[str, Any]
@@ -913,6 +916,9 @@ class JobAgentService:
             if execution.sent:
                 sent_count += 1
 
+            if execution.requires_human_action:
+                human_action_required_count += 1
+
             if not execution.success:
                 errors.append(
                     {
@@ -920,6 +926,9 @@ class JobAgentService:
                         "decision": decision,
                         "status": execution.status,
                         "error": execution.error,
+                        "requires_human_action": (
+                            execution.requires_human_action
+                        ),
                     }
                 )
 
@@ -960,6 +969,9 @@ class JobAgentService:
             executed_count=executed_count,
             submitted_count=submitted_count,
             sent_count=sent_count,
+            human_action_required_count=(
+                human_action_required_count
+            ),
             jobs=[
                 dict(job)
                 for job in ranked_jobs
@@ -973,6 +985,9 @@ class JobAgentService:
                 "dry_run": dry_run,
                 "confirm": confirm,
                 "failed_count": failed_count,
+                "human_action_required_count": (
+                    human_action_required_count
+                ),
             },
         )
 
