@@ -447,6 +447,7 @@ class JobAgentService:
 
         return self.execution_router.route(
             ranked_result,
+            decision=decision,
             page=page,
             fields=fields or {},
             contacts=resolved_contacts,

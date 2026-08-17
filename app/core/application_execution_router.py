@@ -153,6 +153,7 @@ class ApplicationExecutionRouter:
         self,
         ranked_result: Mapping[str, Any],
         *,
+        decision: Optional[ApplicationDecision] = None,
         page: Any = None,
         fields: Optional[dict[str, Any]] = None,
         contacts: Optional[
@@ -181,9 +182,17 @@ class ApplicationExecutionRouter:
                 "ranked_result must be a mapping."
             )
 
-        decision = self.decision_engine.decide(
-            ranked_result
-        )
+        if decision is None:
+            decision = self.decision_engine.decide(
+                ranked_result
+            )
+        elif not isinstance(
+            decision,
+            ApplicationDecision,
+        ):
+            raise TypeError(
+                "decision must be an ApplicationDecision or None."
+            )
 
         job = self._extract_job(
             ranked_result
