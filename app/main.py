@@ -196,6 +196,79 @@ def create_runner(
 # LEGACY SETTINGS SUPPORT
 # ============================================================
 
+def create_end_to_end_pipeline(
+    config: Optional[JobAgentConfig] = None,
+):
+    """
+    Create the safe end-to-end JobAgent workflow.
+
+    Connects:
+
+        discovery
+            ↓
+        matching
+            ↓
+        ranking
+            ↓
+        recruiter discovery
+            ↓
+        personalized outreach
+            ↓
+        outreach tracking
+
+    Hunter is automatically available when
+    HUNTER_API_KEY is configured.
+
+    Email sending remains confirmation-gated and the
+    default EmailSender is dry-run.
+    """
+
+    if config is None:
+        config = load_config()
+
+    config.ensure_directories()
+
+    runner = create_runner(
+        config=config,
+    )
+
+    from app.core.end_to_end_pipeline import (
+        EndToEndPipeline,
+    )
+
+    from app.outreach.contact_discovery import (
+        ContactDiscovery,
+    )
+
+    from app.outreach.hunter_provider import (
+        HunterProvider,
+    )
+
+    from app.outreach.outreach_pipeline import (
+        OutreachPipeline,
+    )
+
+    from app.outreach.outreach_tracker import (
+        OutreachTracker,
+    )
+
+    contact_discovery = ContactDiscovery(
+        providers=[
+            HunterProvider(),
+        ]
+    )
+
+    outreach_tracker = OutreachTracker()
+
+    outreach_pipeline = OutreachPipeline(
+        outreach_tracker=outreach_tracker,
+    )
+
+    return EndToEndPipeline(
+        runner=runner,
+        contact_discovery=contact_discovery,
+        outreach_pipeline=outreach_pipeline,
+    )
 
 def load_settings() -> dict:
     """

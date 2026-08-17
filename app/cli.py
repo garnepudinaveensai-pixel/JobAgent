@@ -135,6 +135,72 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # ========================================================
+    # END-TO-END INTELLIGENCE
+    # ========================================================
+
+    run_parser = subparsers.add_parser(
+        "run",
+        help=(
+            "Run multi-source discovery, matching, ranking, "
+            "recruiter discovery, and outreach preparation."
+        ),
+    )
+
+    run_parser.add_argument(
+        "--keywords",
+        required=True,
+        help="Job search keywords.",
+    )
+
+    run_parser.add_argument(
+        "--location",
+        default=None,
+        help="Optional job location.",
+    )
+
+    run_parser.add_argument(
+        "--board-url",
+        default=None,
+        help=(
+            "Optional public board URL for sources that "
+            "require one, such as Greenhouse, Lever, or Workday."
+        ),
+    )
+
+    run_parser.add_argument(
+        "--min-score",
+        type=float,
+        default=60.0,
+        help="Minimum ranking score from 0 to 100.",
+    )
+
+    run_parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum number of ranked jobs.",
+    )
+
+    run_parser.add_argument(
+        "--eligible-only",
+        action="store_true",
+        help="Keep only eligible matches.",
+    )
+
+    run_parser.add_argument(
+        "--no-outreach",
+        action="store_true",
+        help=(
+            "Stop after ranking and do not discover "
+            "contacts or prepare email."
+        ),
+    )
+
+    run_parser.set_defaults(
+        handler=handle_run,
+    )
+
+    # ========================================================
     # STATUS
     # ========================================================
 
@@ -422,6 +488,200 @@ def handle_discover(args) -> int:
 
     return 0
 
+
+# ============================================================
+# END-TO-END HANDLER
+# ============================================================
+
+
+def handle_run(args) -> int:
+    """
+    Run the safe end-to-end JobAgent workflow.
+
+    This command:
+
+        discovers
+            ↓
+        matches
+            ↓
+        ranks
+            ↓
+        discovers recruiters
+            ↓
+        prepares personalized outreach
+
+    It does NOT send email.
+
+    It does NOT submit applications.
+    """
+
+    from app.main import (
+        create_end_to_end_pipeline,
+    )
+
+    print("=" * 60)
+    print("JobAgent End-to-End Run")
+    print("=" * 60)
+
+    print(
+        f"Keywords: {args.keywords}"
+    )
+
+    print(
+        f"Location: "
+        f"{args.location or '(any)'}"
+    )
+
+    print(
+        f"Minimum score: "
+        f"{args.min_score}"
+    )
+
+    print(
+        f"Limit: "
+        f"{args.limit}"
+    )
+
+    print(
+        "Outreach preparation: "
+        f"{'disabled' if args.no_outreach else 'enabled'}"
+    )
+
+    print()
+
+    try:
+
+        pipeline = (
+            create_end_to_end_pipeline()
+        )
+
+        source_options = {}
+
+        if args.board_url:
+            source_options[
+                "board_url"
+            ] = args.board_url
+
+        result = pipeline.run(
+            keywords=args.keywords,
+            location=args.location,
+            min_score=args.min_score,
+            limit=args.limit,
+            eligible_only=args.eligible_only,
+            prepare_outreach=(
+                not args.no_outreach
+            ),
+            **source_options,
+        )
+
+    except Exception as exc:
+
+        print(
+            f"Run failed: {exc}"
+        )
+
+        return 1
+
+    print()
+
+    print(
+        f"Status: "
+        f"{result.get('status', '')}"
+    )
+
+    print(
+        f"Ranked jobs: "
+        f"{result.get('count', 0)}"
+    )
+
+    print()
+
+    items = (
+        result.get(
+            "outreach",
+            [],
+        )
+        or result.get(
+            "jobs",
+            [],
+        )
+    )
+
+    for index, item in enumerate(
+        items,
+        start=1,
+    ):
+
+        job = item.get(
+            "job",
+            item,
+        )
+
+        print(
+            f"{index}. "
+            f"{job.get('title', '')}"
+        )
+
+        print(
+            f"   Company: "
+            f"{job.get('company', '')}"
+        )
+
+        print(
+            f"   Location: "
+            f"{job.get('location', '')}"
+        )
+
+        print(
+            f"   Ranking score: "
+            f"{item.get('ranking_score', '')}"
+        )
+
+        if "outreach" in item:
+
+            outreach = (
+                item.get(
+                    "outreach"
+                )
+                or {}
+            )
+
+            print(
+                f"   Recruiters found: "
+                f"{len(item.get('contacts', []))}"
+            )
+
+            print(
+                f"   Outreach status: "
+                f"{outreach.get('status', 'none')}"
+            )
+
+            if outreach.get(
+                "email"
+            ):
+
+                print(
+                    f"   Recipient: "
+                    f"{outreach.get('email')}"
+                )
+
+        if job.get(
+            "url"
+        ):
+
+            print(
+                f"   URL: "
+                f"{job.get('url')}"
+            )
+
+        print()
+
+    print(
+        "No email was sent and "
+        "no application was submitted."
+    )
+
+    return 0
 
 # ============================================================
 # STATUS HANDLER

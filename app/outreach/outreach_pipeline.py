@@ -14,9 +14,18 @@ from app.outreach.email_composer import (
 from app.outreach.email_sender import (
     EmailSender,
 )
+from app.outreach.outreach_tracker import (
+    OutreachRecord,
+    OutreachTracker,
+)
 
 
 _MISSING = object()
+
+
+# ============================================================
+# RESULT
+# ============================================================
 
 
 @dataclass(frozen=True)
@@ -24,8 +33,8 @@ class OutreachResult:
     """
     Result of an outreach preparation or sending operation.
 
-    This object is intentionally independent of the concrete
-    EmailComposer and EmailSender implementations.
+    tracker_id contains the persistent OutreachTracker ID when
+    tracking is enabled.
     """
 
     success: bool
@@ -36,11 +45,17 @@ class OutreachResult:
     attachment: Optional[str] = None
     error: Optional[str] = None
     dry_run: bool = False
+    tracker_id: Optional[str] = None
+
+
+# ============================================================
+# PIPELINE
+# ============================================================
 
 
 class OutreachPipeline:
     """
-    Coordinates the complete outreach workflow.
+    Coordinates the complete recruiter outreach workflow.
 
     Flow:
 
@@ -50,9 +65,13 @@ class OutreachPipeline:
             ↓
         email composition
             ↓
+        OutreachTracker
+            ↓
         human confirmation
             ↓
         email sending
+            ↓
+        OutreachTracker
             ↓
         result
 
@@ -60,19 +79,31 @@ class OutreachPipeline:
 
         - Select the best contact.
         - Validate job/candidate input.
-        - Compose the outreach email.
+        - Compose outreach emails.
+        - Attach/reference the selected resume.
         - Respect explicit confirmation.
-        - Adapt to supported composer/sender interfaces.
-        - Normalize sender results.
-        - Never send when confirmation is False.
+        - Send only when explicitly confirmed.
+        - Track prepared outreach.
+        - Track successful sends.
+        - Track failed sends.
+        - Preserve compatibility with existing
+          composer/sender interfaces.
 
-    This class does not:
+    This class does NOT:
 
         - discover contacts
         - perform browser automation
         - store passwords
         - request OTPs
         - expose authentication credentials
+
+    Safety:
+
+        The default EmailSender remains dry-run.
+
+        Real sending requires:
+            1. An explicitly configured sender.
+            2. confirm=True.
     """
 
     def __init__(
@@ -85,6 +116,9 @@ class OutreachPipeline:
         ] = None,
         email_sender: Optional[
             EmailSender
+        ] = None,
+        outreach_tracker: Optional[
+            OutreachTracker
         ] = None,
     ):
         self.contact_selector = (
@@ -99,18 +133,20 @@ class OutreachPipeline:
             else EmailComposer()
         )
 
-        # IMPORTANT:
+        # Default sender is always dry-run.
         #
-        # The default sender is ALWAYS dry-run.
-        #
-        # Real sending must be explicitly configured.
-        # This prevents accidental external email sending.
+        # A real sender must be explicitly injected.
         self.email_sender = (
             email_sender
             if email_sender is not None
             else EmailSender(
                 dry_run=True
             )
+        )
+
+        # Tracking is optional for backward compatibility.
+        self.outreach_tracker = (
+            outreach_tracker
         )
 
     # ========================================================
@@ -147,13 +183,8 @@ class OutreachPipeline:
 
         No email is sent.
 
-        candidate is optional.
-
-        If omitted:
-            candidate = {}
-
-        If explicitly supplied as None:
-            TypeError is raised.
+        When an OutreachTracker is configured, a persistent
+        record with status='prepared' is created.
         """
 
         self._validate_job(job)
@@ -181,11 +212,27 @@ class OutreachPipeline:
                 resume_path=resume_path,
             )
 
-            return self._build_prepared_result(
+            result = self._build_prepared_result(
                 composed=composed,
                 selected_contact=contact,
                 resume_path=resume_path,
             )
+
+            tracker_record = (
+                self._track_prepared(
+                    job=job,
+                    contact=contact,
+                    result=result,
+                )
+            )
+
+            if tracker_record is not None:
+                return self._with_tracker_id(
+                    result,
+                    tracker_record.outreach_id,
+                )
+
+            return result
 
         except Exception as exc:
             return OutreachResult(
@@ -210,30 +257,7 @@ class OutreachPipeline:
         Return the actual result produced by the configured
         composer.
 
-        Supports:
-
-            compose(
-                job,
-                contact,
-                resume_path=None,
-            )
-
-        and:
-
-            compose(
-                job,
-                candidate,
-                contact,
-            )
-
-        and:
-
-            compose(
-                job,
-                candidate,
-                contact,
-                resume_path,
-            )
+        Supports both candidate-aware and legacy composers.
         """
 
         self._validate_job(job)
@@ -280,8 +304,8 @@ class OutreachPipeline:
         confirm=True:
             The configured sender is invoked.
 
-        Explicit confirmation is therefore mandatory before
-        any actual sender call occurs.
+        Explicit confirmation is mandatory before an actual
+        sender call.
         """
 
         self._validate_job(job)
@@ -305,7 +329,13 @@ class OutreachPipeline:
             if not prepared.success:
                 return prepared
 
-            return OutreachResult(
+            tracker_id = (
+                self._mark_confirmation_required(
+                    prepared
+                )
+            )
+
+            confirmation_result = OutreachResult(
                 success=True,
                 status="confirmation_required",
                 email=prepared.email,
@@ -314,8 +344,16 @@ class OutreachPipeline:
                 attachment=prepared.attachment,
             )
 
+            if tracker_id is not None:
+                return self._with_tracker_id(
+                    confirmation_result,
+                    tracker_id,
+                )
+
+            return confirmation_result
+
         # ----------------------------------------------------
-        # CONTACT + COMPOSITION
+        # COMPOSITION
         # ----------------------------------------------------
 
         try:
@@ -352,6 +390,19 @@ class OutreachPipeline:
             )
 
         # ----------------------------------------------------
+        # ENSURE TRACKING RECORD EXISTS
+        # ----------------------------------------------------
+
+        tracker_record = (
+            self._ensure_tracking_record(
+                job=job,
+                contact=selected_contact,
+                composed=composed,
+                resume_path=resume_path,
+            )
+        )
+
+        # ----------------------------------------------------
         # SEND
         # ----------------------------------------------------
 
@@ -363,7 +414,7 @@ class OutreachPipeline:
             )
 
         except Exception as exc:
-            return OutreachResult(
+            result = OutreachResult(
                 success=False,
                 status="send_failed",
                 email=self._get_value(
@@ -390,18 +441,46 @@ class OutreachPipeline:
                     resume_path,
                 ),
                 error=str(exc),
+                tracker_id=(
+                    tracker_record.outreach_id
+                    if tracker_record
+                    else None
+                ),
             )
 
+            self._record_send_failure(
+                tracker_record,
+                error=str(exc),
+            )
+
+            return result
+
         # ----------------------------------------------------
-        # RESULT NORMALIZATION
+        # NORMALIZE RESULT
         # ----------------------------------------------------
 
-        return self._build_send_result(
+        result = self._build_send_result(
             composed=composed,
             sender_result=sender_result,
             selected_contact=selected_contact,
             resume_path=resume_path,
+            tracker_id=(
+                tracker_record.outreach_id
+                if tracker_record
+                else None
+            ),
         )
+
+        # ----------------------------------------------------
+        # UPDATE TRACKER
+        # ----------------------------------------------------
+
+        self._record_send_result(
+            tracker_record,
+            result,
+        )
+
+        return result
 
     # ========================================================
     # COMPOSER ADAPTER
@@ -415,11 +494,38 @@ class OutreachPipeline:
         resume_path: Optional[str],
     ) -> Any:
         """
-        Call the configured composer while supporting multiple
-        composer APIs.
+        Call the configured composer while supporting:
+
+            compose(job, candidate, contact)
+
+            compose(
+                job,
+                candidate,
+                contact,
+                resume_path,
+            )
+
+            compose(
+                job,
+                contact,
+                resume_path=None,
+            )
+
+        Candidate-aware APIs are preferred.
+
+        Unsupported concrete signatures always produce:
+
+            Unsupported EmailComposer.compose()
+            signature.
         """
 
-        compose_method = self.email_composer.compose
+        compose_method = (
+            self.email_composer.compose
+        )
+
+        # ----------------------------------------------------
+        # Inspect the callable.
+        # ----------------------------------------------------
 
         try:
             signature = inspect.signature(
@@ -434,48 +540,29 @@ class OutreachPipeline:
         ):
             parameters = {}
 
-        # ====================================================
-        # CANDIDATE-AWARE COMPOSER
-        # ====================================================
+        parameter_values = list(
+            parameters.values()
+        )
 
-        if "candidate" in parameters:
-            kwargs = {
-                "job": job,
-                "candidate": candidate,
-                "contact": contact,
-            }
+        parameter_names = set(
+            parameters.keys()
+        )
 
-            if "resume_path" in parameters:
-                kwargs["resume_path"] = resume_path
+        has_varargs = any(
+            parameter.kind
+            == inspect.Parameter.VAR_POSITIONAL
+            for parameter in parameter_values
+        )
 
-            return compose_method(
-                **kwargs
-            )
-
-        # ====================================================
-        # CURRENT PRODUCTION COMPOSER
-        # ====================================================
-
-        if "contact" in parameters:
-            kwargs = {
-                "job": job,
-                "contact": contact,
-            }
-
-            if "resume_path" in parameters:
-                kwargs["resume_path"] = resume_path
-
-            return compose_method(
-                **kwargs
-            )
-
-        # ====================================================
-        # POSITIONAL FALLBACK
-        # ====================================================
+        has_varkwargs = any(
+            parameter.kind
+            == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameter_values
+        )
 
         positional_parameters = [
             parameter
-            for parameter in parameters.values()
+            for parameter in parameter_values
             if parameter.kind
             in {
                 inspect.Parameter.POSITIONAL_ONLY,
@@ -487,29 +574,187 @@ class OutreachPipeline:
             positional_parameters
         )
 
-        if parameter_count >= 4:
-            return compose_method(
-                job,
-                candidate,
-                contact,
-                resume_path,
+        # ----------------------------------------------------
+        # Explicitly unsupported zero-argument composer.
+        #
+        # This is important because a concrete:
+        #
+        #     def compose(self):
+        #
+        # should NOT receive our keyword arguments and leak
+        # Python's "unexpected keyword argument" message.
+        # ----------------------------------------------------
+
+        if (
+            not has_varargs
+            and not has_varkwargs
+            and parameter_count == 0
+        ):
+            raise TypeError(
+                "Unsupported "
+                "EmailComposer.compose() "
+                "signature."
             )
+
+        # ====================================================
+        # CANDIDATE-AWARE COMPOSER
+        # ====================================================
+
+        if "candidate" in parameter_names:
+            kwargs = {
+                "job": job,
+                "candidate": candidate,
+                "contact": contact,
+            }
+
+            if "resume_path" in parameter_names:
+                kwargs[
+                    "resume_path"
+                ] = resume_path
+
+            try:
+                return compose_method(
+                    **kwargs
+                )
+
+            except TypeError as exc:
+                raise TypeError(
+                    "Unsupported "
+                    "EmailComposer.compose() "
+                    "signature."
+                ) from exc
+
+        # ====================================================
+        # CURRENT PRODUCTION COMPOSER
+        # ====================================================
+
+        if "contact" in parameter_names:
+            kwargs = {
+                "job": job,
+                "contact": contact,
+            }
+
+            if "resume_path" in parameter_names:
+                kwargs[
+                    "resume_path"
+                ] = resume_path
+
+            try:
+                return compose_method(
+                    **kwargs
+                )
+
+            except TypeError as exc:
+                raise TypeError(
+                    "Unsupported "
+                    "EmailComposer.compose() "
+                    "signature."
+                ) from exc
+
+        # ====================================================
+        # DYNAMIC CALLABLE / MAGICMOCK
+        # ====================================================
+
+        if (
+            has_varargs
+            or has_varkwargs
+            or not parameters
+        ):
+            try:
+                return compose_method(
+                    job=job,
+                    candidate=candidate,
+                    contact=contact,
+                    resume_path=resume_path,
+                )
+
+            except TypeError as first_error:
+                try:
+                    return compose_method(
+                        job=job,
+                        contact=contact,
+                        resume_path=resume_path,
+                    )
+
+                except TypeError:
+                    try:
+                        return compose_method(
+                            job,
+                            candidate,
+                            contact,
+                        )
+
+                    except TypeError:
+                        raise TypeError(
+                            "Unsupported "
+                            "EmailComposer.compose() "
+                            "signature."
+                        ) from first_error
+
+        # ====================================================
+        # POSITIONAL CANDIDATE-AWARE COMPOSER
+        # ====================================================
+
+        if parameter_count >= 4:
+            try:
+                return compose_method(
+                    job,
+                    candidate,
+                    contact,
+                    resume_path,
+                )
+
+            except TypeError as exc:
+                raise TypeError(
+                    "Unsupported "
+                    "EmailComposer.compose() "
+                    "signature."
+                ) from exc
+
+        # ====================================================
+        # THREE-PARAMETER COMPOSER
+        # ====================================================
 
         if parameter_count == 3:
-            return compose_method(
-                job,
-                candidate,
-                contact,
-            )
+            try:
+                return compose_method(
+                    job,
+                    candidate,
+                    contact,
+                )
+
+            except TypeError as exc:
+                raise TypeError(
+                    "Unsupported "
+                    "EmailComposer.compose() "
+                    "signature."
+                ) from exc
+
+        # ====================================================
+        # TWO-PARAMETER PRODUCTION COMPOSER
+        # ====================================================
 
         if parameter_count == 2:
-            return compose_method(
-                job,
-                contact,
-            )
+            try:
+                return compose_method(
+                    job,
+                    contact,
+                )
+
+            except TypeError as exc:
+                raise TypeError(
+                    "Unsupported "
+                    "EmailComposer.compose() "
+                    "signature."
+                ) from exc
+
+        # ====================================================
+        # EVERYTHING ELSE
+        # ====================================================
 
         raise TypeError(
-            "Unsupported EmailComposer.compose() "
+            "Unsupported "
+            "EmailComposer.compose() "
             "signature."
         )
 
@@ -531,7 +776,9 @@ class OutreachPipeline:
         or a compatible legacy sender interface.
         """
 
-        send_method = self.email_sender.send
+        send_method = (
+            self.email_sender.send
+        )
 
         try:
             signature = inspect.signature(
@@ -547,7 +794,7 @@ class OutreachPipeline:
             parameters = {}
 
         # ----------------------------------------------------
-        # CURRENT PRODUCTION EmailSender
+        # CURRENT PRODUCTION SENDER
         # ----------------------------------------------------
 
         if len(parameters) == 1:
@@ -589,19 +836,29 @@ class OutreachPipeline:
         kwargs = {}
 
         if "recipient" in parameters:
-            kwargs["recipient"] = recipient
+            kwargs[
+                "recipient"
+            ] = recipient
 
         if "subject" in parameters:
-            kwargs["subject"] = subject
+            kwargs[
+                "subject"
+            ] = subject
 
         if "message" in parameters:
-            kwargs["message"] = message
+            kwargs[
+                "message"
+            ] = message
 
         elif "body" in parameters:
-            kwargs["body"] = message
+            kwargs[
+                "body"
+            ] = message
 
         if "attachment" in parameters:
-            kwargs["attachment"] = attachment
+            kwargs[
+                "attachment"
+            ] = attachment
 
         if kwargs:
             return send_method(
@@ -626,8 +883,7 @@ class OutreachPipeline:
         resume_path: Optional[str],
     ) -> OutreachResult:
         """
-        Convert different composer result formats into
-        OutreachResult.
+        Normalize composer output.
         """
 
         recipient = self._get_value(
@@ -661,8 +917,12 @@ class OutreachPipeline:
             success=True,
             status="prepared",
             email=recipient,
-            subject=str(subject or ""),
-            message=str(message or ""),
+            subject=str(
+                subject or ""
+            ),
+            message=str(
+                message or ""
+            ),
             attachment=attachment,
         )
 
@@ -672,6 +932,7 @@ class OutreachPipeline:
         sender_result: Any,
         selected_contact: ContactSelection,
         resume_path: Optional[str],
+        tracker_id: Optional[str] = None,
     ) -> OutreachResult:
         """
         Normalize:
@@ -758,6 +1019,7 @@ class OutreachPipeline:
                 ),
                 attachment=sender_attachment,
                 dry_run=dry_run,
+                tracker_id=tracker_id,
             )
 
         return OutreachResult(
@@ -773,6 +1035,258 @@ class OutreachPipeline:
             attachment=sender_attachment,
             error=error,
             dry_run=dry_run,
+            tracker_id=tracker_id,
+        )
+
+    # ========================================================
+    # TRACKER INTEGRATION
+    # ========================================================
+
+    def _track_prepared(
+        self,
+        job: dict,
+        contact: ContactSelection,
+        result: OutreachResult,
+    ) -> Optional[OutreachRecord]:
+        """
+        Create a persistent tracker record for prepared
+        outreach.
+
+        Tracking failures never break email preparation.
+        """
+
+        if self.outreach_tracker is None:
+            return None
+
+        try:
+            contact_data = dict(
+                contact.contact
+            )
+
+            contact_data.setdefault(
+                "email",
+                contact.email,
+            )
+
+            contact_data.setdefault(
+                "score",
+                contact.score,
+            )
+
+            contact_data.setdefault(
+                "reason",
+                contact.reason,
+            )
+
+            return self.outreach_tracker.create(
+                job=job,
+                contact=contact_data,
+                subject=result.subject,
+                resume_path=(
+                    result.attachment or ""
+                ),
+                status="prepared",
+            )
+
+        except Exception:
+            return None
+
+    def _ensure_tracking_record(
+        self,
+        job: dict,
+        contact: ContactSelection,
+        composed: Any,
+        resume_path: Optional[str],
+    ) -> Optional[OutreachRecord]:
+        """
+        Ensure a persistent tracker record exists before
+        sending.
+        """
+
+        if self.outreach_tracker is None:
+            return None
+
+        recipient = self._get_value(
+            composed,
+            "recipient",
+            default=contact.email,
+        )
+
+        subject = self._get_value(
+            composed,
+            "subject",
+            default="",
+        )
+
+        attachment = self._attachment_from(
+            composed,
+            resume_path,
+        )
+
+        contact_data = dict(
+            contact.contact
+        )
+
+        contact_data.setdefault(
+            "email",
+            contact.email,
+        )
+
+        contact_data.setdefault(
+            "score",
+            contact.score,
+        )
+
+        contact_data.setdefault(
+            "reason",
+            contact.reason,
+        )
+
+        try:
+            existing = (
+                self.outreach_tracker.find(
+                    contact_email=recipient,
+                )
+            )
+
+            if existing is not None:
+                return existing
+
+        except Exception:
+            pass
+
+        try:
+            return self.outreach_tracker.create(
+                job=job,
+                contact=contact_data,
+                subject=str(
+                    subject or ""
+                ),
+                resume_path=(
+                    attachment or ""
+                ),
+                status="confirmation_required",
+            )
+
+        except Exception:
+            return None
+
+    def _mark_confirmation_required(
+        self,
+        prepared: OutreachResult,
+    ) -> Optional[str]:
+        """
+        Move an existing prepared record to
+        confirmation_required.
+        """
+
+        if self.outreach_tracker is None:
+            return None
+
+        if not prepared.email:
+            return None
+
+        try:
+            record = (
+                self.outreach_tracker.find(
+                    contact_email=prepared.email,
+                )
+            )
+
+            if record is None:
+                return None
+
+            updated = (
+                self.outreach_tracker.update_status(
+                    record.outreach_id,
+                    "confirmation_required",
+                )
+            )
+
+            if updated is None:
+                return None
+
+            return updated.outreach_id
+
+        except Exception:
+            return None
+
+    def _record_send_result(
+        self,
+        tracker_record: Optional[
+            OutreachRecord
+        ],
+        result: OutreachResult,
+    ) -> None:
+        """
+        Persist the result of a send operation.
+
+        Tracker failures never replace the actual send result.
+        """
+
+        if (
+            self.outreach_tracker is None
+            or tracker_record is None
+        ):
+            return
+
+        try:
+            self.outreach_tracker.record_send_result(
+                tracker_record.outreach_id,
+                success=result.success,
+                error=result.error,
+                dry_run=result.dry_run,
+            )
+
+        except Exception:
+            pass
+
+    def _record_send_failure(
+        self,
+        tracker_record: Optional[
+            OutreachRecord
+        ],
+        error: str,
+    ) -> None:
+        """
+        Persist a failed send attempt.
+        """
+
+        if (
+            self.outreach_tracker is None
+            or tracker_record is None
+        ):
+            return
+
+        try:
+            self.outreach_tracker.record_send_result(
+                tracker_record.outreach_id,
+                success=False,
+                error=error,
+            )
+
+        except Exception:
+            pass
+
+    @staticmethod
+    def _with_tracker_id(
+        result: OutreachResult,
+        tracker_id: str,
+    ) -> OutreachResult:
+        """
+        Return a copy of OutreachResult with tracker ID.
+        """
+
+        return OutreachResult(
+            success=result.success,
+            status=result.status,
+            email=result.email,
+            subject=result.subject,
+            message=result.message,
+            attachment=result.attachment,
+            error=result.error,
+            dry_run=result.dry_run,
+            tracker_id=tracker_id,
         )
 
     # ========================================================
@@ -802,10 +1316,11 @@ class OutreachPipeline:
         """
         Normalize candidate information.
 
-        An omitted candidate becomes {}.
+        Omitted candidate:
+            {}
 
-        Explicit None or another non-dictionary value is
-        rejected.
+        Explicit None/non-dictionary:
+            TypeError
         """
 
         if candidate is _MISSING:
@@ -904,10 +1419,12 @@ class OutreachPipeline:
         Extract an error message from a sender result.
         """
 
-        error = OutreachPipeline._get_value(
-            result,
-            "error",
-            default=None,
+        error = (
+            OutreachPipeline._get_value(
+                result,
+                "error",
+                default=None,
+            )
         )
 
         if error is None:
@@ -925,9 +1442,9 @@ class OutreachPipeline:
 
         Priority:
 
-            1. Explicit resume_path argument.
-            2. Composer attachment.
-            3. Composer resume_path.
+            1. Explicit resume_path
+            2. Composer attachment
+            3. Composer resume_path
         """
 
         if explicit_resume_path is not None:
@@ -938,25 +1455,31 @@ class OutreachPipeline:
             if value:
                 return value
 
-        attachment = OutreachPipeline._get_value(
-            composed,
-            "attachment",
-            default=None,
+        attachment = (
+            OutreachPipeline._get_value(
+                composed,
+                "attachment",
+                default=None,
+            )
         )
 
         if attachment is None:
-            attachment = OutreachPipeline._get_value(
-                composed,
-                "resume_path",
-                default=None,
+            attachment = (
+                OutreachPipeline._get_value(
+                    composed,
+                    "resume_path",
+                    default=None,
+                )
             )
 
         if attachment is None:
             return None
 
-        return str(
+        value = str(
             attachment
-        )
+        ).strip()
+
+        return value or None
 
 
 __all__ = [
