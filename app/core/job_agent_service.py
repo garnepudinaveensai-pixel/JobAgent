@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from app.core.agent_runner import AgentRunner
+from app.core.application_history import ApplicationHistory
 from app.core.application_decision_engine import (
     ApplicationDecisionEngine,
 )
@@ -115,6 +116,7 @@ class JobAgentService:
         outreach_pipeline: Optional[
             OutreachPipeline
         ] = None,
+        application_history: Optional[ApplicationHistory] = None,
     ) -> None:
 
         if runner is None:
@@ -123,6 +125,7 @@ class JobAgentService:
             )
 
         self.runner = runner
+        self.application_history = application_history
 
         # ----------------------------------------------------
         # Existing high-level pipeline
@@ -345,6 +348,127 @@ class JobAgentService:
         return decisions
 
     # ========================================================
+    # APPLICATION HISTORY
+    # ========================================================
+
+    @staticmethod
+    def _history_job(
+        ranked_result: Mapping[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        job = ranked_result.get("job")
+        if not isinstance(job, Mapping):
+            return None
+        return dict(job)
+
+    def _history_blocking_record(
+        self,
+        ranked_result: Mapping[str, Any],
+    ) -> Optional[Any]:
+        """Return a history record that should prevent a duplicate action."""
+        if self.application_history is None:
+            return None
+
+        job = self._history_job(ranked_result)
+        if job is None:
+            return None
+
+        record = self.application_history.get(job)
+        if record is None:
+            return None
+
+        # These states represent an action already taken or a state
+        # requiring human intervention. Do not automatically repeat it.
+        blocking_statuses = {
+            "applied",
+            "outreach_sent",
+            "confirmation_required",
+            "captcha_detected",
+            "login_required",
+            "human_action_required",
+            "job_unavailable",
+            "form_not_found",
+            "navigation_failed",
+        }
+
+        return record if record.status in blocking_statuses else None
+
+    def _record_execution_history(
+        self,
+        ranked_result: Mapping[str, Any],
+        decision: Any,
+        result: ExecutionResult,
+    ) -> None:
+        """Persist an execution outcome without changing its result."""
+        if self.application_history is None:
+            return
+
+        job = self._history_job(ranked_result)
+        if job is None:
+            return
+
+        decision_name = str(
+            getattr(decision, "decision", "")
+        ).strip().lower()
+        status = str(result.status or "error").strip().lower()
+
+        allowed = {
+            "discovered", "review", "skipped", "prepared",
+            "confirmation_required", "applied", "outreach_sent",
+            "captcha_detected", "login_required", "human_action_required",
+            "job_unavailable", "form_not_found", "navigation_failed",
+            "validation_failed", "application_prepare_failed",
+            "submission_timeout", "submission_failed", "send_failed", "error",
+        }
+        history_status = status if status in allowed else "error"
+
+        self.application_history.update(
+            job,
+            decision=decision_name,
+            status=history_status,
+            human_action_required=bool(
+                getattr(result, "requires_human_action", False)
+            ),
+            submitted=bool(getattr(result, "submitted", False)),
+            sent=bool(getattr(result, "sent", False)),
+            error=(
+                str(result.error)
+                if getattr(result, "error", None)
+                else None
+            ),
+            metadata={
+                "execution_status": result.status,
+                "success": bool(result.success),
+                "ranking_score": self._score(ranked_result),
+            },
+        )
+
+    def _duplicate_result(
+        self,
+        ranked_result: Mapping[str, Any],
+        record: Any,
+    ) -> ExecutionResult:
+        job = self._history_job(ranked_result) or {}
+        return ExecutionResult(
+            success=True,
+            decision="skip",
+            status="duplicate_prevented",
+            message=(
+                "Application action prevented because this job already "
+                f"has history status '{record.status}'."
+            ),
+            job=job,
+            ranking_score=self._score(ranked_result),
+            metadata={
+                "duplicate_prevented": True,
+                "history_id": record.history_id,
+                "history_status": record.status,
+                "history_identity": record.identity,
+                "human_action_required": record.human_action_required,
+            },
+            requires_human_action=bool(record.human_action_required),
+        )
+
+    # ========================================================
     # INTERNAL EXECUTION
     # ========================================================
 
@@ -503,6 +627,18 @@ class JobAgentService:
             )
 
         # ----------------------------------------------------
+        # DUPLICATE PREVENTION
+        # ----------------------------------------------------
+        blocking_record = self._history_blocking_record(
+            ranked_result
+        )
+        if blocking_record is not None:
+            return self._duplicate_result(
+                ranked_result,
+                blocking_record,
+            )
+
+        # ----------------------------------------------------
         # IMPORTANT:
         # Reuse an existing decision when the caller already
         # evaluated the job.
@@ -513,7 +649,7 @@ class JobAgentService:
                 ranked_result
             )
 
-        return self._execute_with_decision(
+        result = self._execute_with_decision(
             ranked_result,
             decision,
             page=page,
@@ -529,6 +665,14 @@ class JobAgentService:
             dry_run=dry_run,
             **provider_options,
         )
+
+        self._record_execution_history(
+            ranked_result,
+            decision,
+            result,
+        )
+
+        return result
 
     # ========================================================
     # BATCH EXECUTION
@@ -607,6 +751,18 @@ class JobAgentService:
             page = None
 
             try:
+                blocking_record = self._history_blocking_record(
+                    ranked_result
+                )
+                if blocking_record is not None:
+                    results.append(
+                        self._duplicate_result(
+                            ranked_result,
+                            blocking_record,
+                        )
+                    )
+                    continue
+
                 # ------------------------------------------------
                 # DECIDE EXACTLY ONCE
                 # ------------------------------------------------
@@ -684,6 +840,12 @@ class JobAgentService:
                         dry_run=dry_run,
                         **provider_options,
                     )
+                )
+
+                self._record_execution_history(
+                    ranked_result,
+                    decision,
+                    result,
                 )
 
                 results.append(
