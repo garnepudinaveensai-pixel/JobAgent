@@ -9,11 +9,9 @@ from app.outreach.contact_selector import (
     ContactSelector,
 )
 from app.outreach.email_composer import (
-    ComposedEmail,
     EmailComposer,
 )
 from app.outreach.email_sender import (
-    EmailSendResult,
     EmailSender,
 )
 
@@ -25,6 +23,9 @@ _MISSING = object()
 class OutreachResult:
     """
     Result of an outreach preparation or sending operation.
+
+    This object is intentionally independent of the concrete
+    EmailComposer and EmailSender implementations.
     """
 
     success: bool
@@ -99,9 +100,10 @@ class OutreachPipeline:
         )
 
         # IMPORTANT:
-        # The default sender is always dry-run.
         #
-        # A real sender must be explicitly injected.
+        # The default sender is ALWAYS dry-run.
+        #
+        # Real sending must be explicitly configured.
         # This prevents accidental external email sending.
         self.email_sender = (
             email_sender
@@ -145,7 +147,7 @@ class OutreachPipeline:
 
         No email is sent.
 
-        `candidate` is optional for backward compatibility.
+        candidate is optional.
 
         If omitted:
             candidate = {}
@@ -208,7 +210,7 @@ class OutreachPipeline:
         Return the actual result produced by the configured
         composer.
 
-        Supported composer APIs include:
+        Supports:
 
             compose(
                 job,
@@ -216,13 +218,15 @@ class OutreachPipeline:
                 resume_path=None,
             )
 
-        and candidate-aware variants such as:
+        and:
 
             compose(
                 job,
                 candidate,
                 contact,
             )
+
+        and:
 
             compose(
                 job,
@@ -287,7 +291,7 @@ class OutreachPipeline:
         )
 
         # ----------------------------------------------------
-        # Confirmation gate
+        # CONFIRMATION GATE
         # ----------------------------------------------------
 
         if not confirm:
@@ -311,7 +315,7 @@ class OutreachPipeline:
             )
 
         # ----------------------------------------------------
-        # Composition
+        # CONTACT + COMPOSITION
         # ----------------------------------------------------
 
         try:
@@ -348,7 +352,7 @@ class OutreachPipeline:
             )
 
         # ----------------------------------------------------
-        # Send
+        # SEND
         # ----------------------------------------------------
 
         try:
@@ -389,7 +393,7 @@ class OutreachPipeline:
             )
 
         # ----------------------------------------------------
-        # Normalize result
+        # RESULT NORMALIZATION
         # ----------------------------------------------------
 
         return self._build_send_result(
@@ -413,37 +417,6 @@ class OutreachPipeline:
         """
         Call the configured composer while supporting multiple
         composer APIs.
-
-        Supported APIs:
-
-        1. Candidate-aware composer:
-
-            compose(
-                job,
-                candidate,
-                contact,
-            )
-
-        2. Candidate-aware composer with resume path:
-
-            compose(
-                job,
-                candidate,
-                contact,
-                resume_path,
-            )
-
-        3. Current production EmailComposer:
-
-            compose(
-                job,
-                contact,
-                resume_path=None,
-            )
-
-        Candidate-aware APIs are checked first so a composer
-        containing both candidate and contact parameters is
-        handled correctly.
         """
 
         compose_method = self.email_composer.compose
@@ -574,7 +547,7 @@ class OutreachPipeline:
             parameters = {}
 
         # ----------------------------------------------------
-        # Current production EmailSender
+        # CURRENT PRODUCTION EmailSender
         # ----------------------------------------------------
 
         if len(parameters) == 1:
@@ -583,7 +556,7 @@ class OutreachPipeline:
             )
 
         # ----------------------------------------------------
-        # Legacy/test sender
+        # LEGACY / TEST SENDER
         # ----------------------------------------------------
 
         recipient = self._get_value(
@@ -896,7 +869,6 @@ class OutreachPipeline:
             False
             {"success": True}
             object.success
-            EmailSendResult
         """
 
         if isinstance(
@@ -985,3 +957,9 @@ class OutreachPipeline:
         return str(
             attachment
         )
+
+
+__all__ = [
+    "OutreachResult",
+    "OutreachPipeline",
+]
