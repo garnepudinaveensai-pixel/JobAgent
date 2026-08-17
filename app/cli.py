@@ -6,6 +6,7 @@ from typing import Optional
 from app.config import create_default_config
 from app.main import create_runner
 from app.jobs.job_store import JobStore
+from app.core.application_reporter import ApplicationReporter
 
 
 # ============================================================
@@ -198,6 +199,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser.set_defaults(
         handler=handle_run,
+    )
+
+    # ========================================================
+    # REPORT
+    # ========================================================
+
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Render a saved JobAgent result JSON file.",
+    )
+
+    report_parser.add_argument(
+        "--input",
+        required=True,
+        help="Path to a JSON file containing an execution or run result.",
+    )
+
+    report_parser.set_defaults(
+        handler=handle_report,
     )
 
     # ========================================================
@@ -682,6 +702,23 @@ def handle_run(args) -> int:
     )
 
     return 0
+
+# ============================================================
+# REPORT HANDLER
+# ============================================================
+
+
+def handle_report(args) -> int:
+    """Render a saved execution/run result as a human-readable report."""
+
+    try:
+        result = ApplicationReporter.load_json(args.input)
+        print(ApplicationReporter.render(result))
+        return 0
+    except Exception as exc:
+        print(f"Report failed: {exc}")
+        return 1
+
 
 # ============================================================
 # STATUS HANDLER
