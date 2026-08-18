@@ -11,6 +11,9 @@ from app.config import (
     create_default_config,
 )
 from app.core.agent_runner import AgentRunner
+from app.core.application_history import ApplicationHistory
+from app.core.application_lifecycle import ApplicationLifecycle
+from app.core.job_agent_service import JobAgentService
 from app.jobs.job_store import JobStore
 
 
@@ -184,12 +187,120 @@ def create_runner(
     # Fully wired AgentRunner
     # --------------------------------------------------------
 
-    return AgentRunner(
+    runner = AgentRunner(
         config=config,
         job_store=job_store,
         job_match_pipeline=job_match_pipeline,
         job_source_manager=source_manager,
     )
+
+    # Keep the browser manager available to the service/CLI so
+    # application preparation can create isolated Playwright pages.
+    runner.browser_manager = browser
+
+    return runner
+
+
+# ============================================================
+# MASTER SERVICE CREATION
+# ============================================================
+
+
+def create_job_agent_service(
+    config: Optional[JobAgentConfig] = None,
+    *,
+    runner: Optional[AgentRunner] = None,
+    end_to_end_pipeline=None,
+    application_history: Optional[ApplicationHistory] = None,
+    application_lifecycle: Optional[ApplicationLifecycle] = None,
+) -> JobAgentService:
+    """Create the fully integrated, safety-first JobAgent service.
+
+    This is the production composition root for the application layer.
+    It wires discovery/matching/ranking to decision, history, lifecycle,
+    routing, application preparation, and outreach.
+
+    Safe defaults are preserved: the service itself defaults to
+    ``dry_run=True`` and ``confirm=False``; this factory performs no
+    application submission or email sending.
+    """
+
+    if config is None:
+        config = load_config()
+
+    config.ensure_directories()
+
+    if runner is None and end_to_end_pipeline is None:
+        pipeline = create_end_to_end_pipeline(config=config)
+        runner = pipeline.runner
+        end_to_end_pipeline = pipeline
+    elif end_to_end_pipeline is None:
+        # Reuse the supplied runner rather than constructing a second
+        # discovery stack.
+        from app.core.end_to_end_pipeline import EndToEndPipeline
+
+        end_to_end_pipeline = EndToEndPipeline(
+            runner=runner,
+        )
+
+    if runner is None:
+        runner = getattr(
+            end_to_end_pipeline,
+            "runner",
+            None,
+        )
+
+    if runner is None:
+        raise ValueError(
+            "A runner is required to create JobAgentService."
+        )
+
+    if application_history is None:
+        history_path = Path(
+            config.storage.application_history_file
+        )
+        application_history = ApplicationHistory(
+            storage_path=str(history_path)
+        )
+
+    if application_lifecycle is None:
+        application_lifecycle = ApplicationLifecycle(
+            application_history
+        )
+
+    return JobAgentService(
+        runner,
+        end_to_end_pipeline=end_to_end_pipeline,
+        application_history=application_history,
+        application_lifecycle=application_lifecycle,
+    )
+
+
+def create_application_page_factory(
+    service: JobAgentService,
+):
+    """Return a page factory backed by the runner's BrowserManager."""
+
+    if service is None:
+        raise ValueError("service cannot be None.")
+
+    browser = getattr(
+        service.runner,
+        "browser_manager",
+        None,
+    )
+
+    if browser is None:
+        raise RuntimeError(
+            "JobAgentService runner does not expose a BrowserManager."
+        )
+
+    def _factory(ranked_result):
+        del ranked_result
+        browser.start()
+        return browser.new_page()
+
+    return _factory
 
 
 # ============================================================

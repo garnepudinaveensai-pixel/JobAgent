@@ -106,6 +106,10 @@ class StorageConfig:
         "data/jobs/applications.json"
     )
 
+    application_history_file: str = (
+        "data/jobs/application_history.json"
+    )
+
 
 # ============================================================
 # MAIN JOBAGENT CONFIGURATION
@@ -153,6 +157,9 @@ class JobAgentConfig:
             ).parent,
             Path(
                 self.storage.applications_file
+            ).parent,
+            Path(
+                self.storage.application_history_file
             ).parent,
         ]
 
@@ -333,6 +340,9 @@ class JobAgentConfig:
                 ),
                 "applications_file": (
                     self.storage.applications_file
+                ),
+                "application_history_file": (
+                    self.storage.application_history_file
                 ),
             },
         }

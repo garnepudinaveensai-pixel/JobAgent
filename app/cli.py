@@ -4,7 +4,11 @@ import argparse
 from typing import Optional
 
 from app.config import create_default_config
-from app.main import create_runner
+from app.main import (
+    create_application_page_factory,
+    create_job_agent_service,
+    create_runner,
+)
 from app.jobs.job_store import JobStore
 from app.core.application_reporter import ApplicationReporter
 
@@ -192,8 +196,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-outreach",
         action="store_true",
         help=(
-            "Stop after ranking and do not discover "
-            "contacts or prepare email."
+            "Do not prepare recruiter outreach for outreach decisions."
+        ),
+    )
+
+    run_parser.add_argument(
+        "--execute",
+        action="store_true",
+        help=(
+            "Explicitly allow real application/email execution. "
+            "Without this flag the run is dry-run only."
         ),
     )
 
@@ -515,193 +527,132 @@ def handle_discover(args) -> int:
 
 
 def handle_run(args) -> int:
+    """Run the integrated JobAgent service.
+
+    Default mode is safe: applications and outreach are prepared
+    but no real submission/sending is allowed. Real execution is
+    available only through the explicit ``--execute`` flag.
     """
-    Run the safe end-to-end JobAgent workflow.
-
-    This command:
-
-        discovers
-            ↓
-        matches
-            ↓
-        ranks
-            ↓
-        discovers recruiters
-            ↓
-        prepares personalized outreach
-
-    It does NOT send email.
-
-    It does NOT submit applications.
-    """
-
-    from app.main import (
-        create_end_to_end_pipeline,
-    )
 
     print("=" * 60)
     print("JobAgent End-to-End Run")
     print("=" * 60)
-
+    print(f"Keywords: {args.keywords}")
+    print(f"Location: {args.location or '(any)'}")
+    print(f"Minimum score: {args.min_score}")
+    print(f"Limit: {args.limit}")
     print(
-        f"Keywords: {args.keywords}"
+        "Execution mode: "
+        f"{'LIVE (explicitly enabled)' if args.execute else 'DRY RUN'}"
     )
-
-    print(
-        f"Location: "
-        f"{args.location or '(any)'}"
-    )
-
-    print(
-        f"Minimum score: "
-        f"{args.min_score}"
-    )
-
-    print(
-        f"Limit: "
-        f"{args.limit}"
-    )
-
     print(
         "Outreach preparation: "
         f"{'disabled' if args.no_outreach else 'enabled'}"
     )
-
     print()
 
-    try:
+    service = None
+    browser = None
 
-        pipeline = (
-            create_end_to_end_pipeline()
+    try:
+        service = create_job_agent_service()
+        browser = getattr(
+            service.runner,
+            "browser_manager",
+            None,
         )
 
         source_options = {}
-
         if args.board_url:
-            source_options[
-                "board_url"
-            ] = args.board_url
+            source_options["board_url"] = args.board_url
 
-        result = pipeline.run(
+        page_factory = create_application_page_factory(
+            service
+        )
+
+        result = service.run(
             keywords=args.keywords,
             location=args.location,
             min_score=args.min_score,
             limit=args.limit,
             eligible_only=args.eligible_only,
-            prepare_outreach=(
-                not args.no_outreach
-            ),
+            page_factory=page_factory,
+            confirm=bool(args.execute),
+            dry_run=not bool(args.execute),
             **source_options,
         )
 
     except Exception as exc:
-
-        print(
-            f"Run failed: {exc}"
-        )
-
+        print(f"Run failed: {exc}")
         return 1
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    data = result.to_dict()
 
     print()
-
+    print(f"Status: {data.get('status', '')}")
+    print(f"Discovered jobs: {data.get('discovered_count', 0)}")
+    print(f"Processed jobs: {data.get('processed_count', 0)}")
+    print(f"Apply decisions: {data.get('apply_count', 0)}")
+    print(f"Outreach decisions: {data.get('outreach_count', 0)}")
+    print(f"Review decisions: {data.get('review_count', 0)}")
+    print(f"Skipped: {data.get('skip_count', 0)}")
+    print(f"Submitted: {data.get('submitted_count', 0)}")
+    print(f"Emails sent: {data.get('sent_count', 0)}")
     print(
-        f"Status: "
-        f"{result.get('status', '')}"
+        "Human action required: "
+        f"{data.get('human_action_required_count', 0)}"
     )
 
-    print(
-        f"Ranked jobs: "
-        f"{result.get('count', 0)}"
-    )
-
-    print()
-
-    items = (
-        result.get(
-            "outreach",
-            [],
-        )
-        or result.get(
-            "jobs",
-            [],
-        )
-    )
-
-    for index, item in enumerate(
-        items,
-        start=1,
-    ):
-
-        job = item.get(
-            "job",
-            item,
-        )
-
-        print(
-            f"{index}. "
-            f"{job.get('title', '')}"
-        )
-
-        print(
-            f"   Company: "
-            f"{job.get('company', '')}"
-        )
-
-        print(
-            f"   Location: "
-            f"{job.get('location', '')}"
-        )
-
-        print(
-            f"   Ranking score: "
-            f"{item.get('ranking_score', '')}"
-        )
-
-        if "outreach" in item:
-
-            outreach = (
-                item.get(
-                    "outreach"
-                )
-                or {}
-            )
-
-            print(
-                f"   Recruiters found: "
-                f"{len(item.get('contacts', []))}"
-            )
-
-            print(
-                f"   Outreach status: "
-                f"{outreach.get('status', 'none')}"
-            )
-
-            if outreach.get(
-                "email"
-            ):
-
-                print(
-                    f"   Recipient: "
-                    f"{outreach.get('email')}"
-                )
-
-        if job.get(
-            "url"
-        ):
-
-            print(
-                f"   URL: "
-                f"{job.get('url')}"
-            )
-
+    executions = data.get("executions", []) or []
+    if executions:
         print()
+        print("RESULTS")
+        print("-" * 60)
 
-    print(
-        "No email was sent and "
-        "no application was submitted."
-    )
+        for index, execution in enumerate(executions, start=1):
+            job = execution.get("job", {}) or {}
+            print(
+                f"{index}. {job.get('title', '')} | "
+                f"{job.get('company', '')}"
+            )
+            print(
+                f"   Decision: {execution.get('decision', '')}"
+            )
+            print(
+                f"   Status: {execution.get('status', '')}"
+            )
+            print(
+                f"   Score: {execution.get('ranking_score', '')}"
+            )
+            if execution.get("requires_human_action"):
+                print("   HUMAN ACTION REQUIRED")
+            if execution.get("error"):
+                print(
+                    f"   Error: {execution.get('error')}"
+                )
 
-    return 0
+    if not args.execute:
+        print()
+        print(
+            "DRY RUN: no application was submitted and "
+            "no email was sent."
+        )
+    else:
+        print()
+        print(
+            "LIVE execution was explicitly enabled with --execute."
+        )
+
+    # JobAgent's run result intentionally remains successful when
+    # individual jobs fail; those failures are exposed in errors.
+    return 0 if data.get("success", False) else 1
+
 
 # ============================================================
 # REPORT HANDLER
