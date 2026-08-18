@@ -6,6 +6,9 @@ from typing import Any, Iterable, Mapping, Optional
 
 from app.core.agent_runner import AgentRunner
 from app.core.application_history import ApplicationHistory
+from app.core.application_lifecycle import (
+    ApplicationLifecycle,
+)
 from app.core.application_decision_engine import (
     ApplicationDecisionEngine,
 )
@@ -117,6 +120,9 @@ class JobAgentService:
             OutreachPipeline
         ] = None,
         application_history: Optional[ApplicationHistory] = None,
+        application_lifecycle: Optional[
+            ApplicationLifecycle
+        ] = None,
     ) -> None:
 
         if runner is None:
@@ -126,6 +132,9 @@ class JobAgentService:
 
         self.runner = runner
         self.application_history = application_history
+        self.application_lifecycle = (
+            application_lifecycle
+        )
 
         # ----------------------------------------------------
         # Existing high-level pipeline
@@ -469,6 +478,117 @@ class JobAgentService:
         )
 
     # ========================================================
+    # LIFECYCLE
+    # ========================================================
+
+    def _evaluate_lifecycle(
+        self,
+        ranked_result: Mapping[str, Any],
+    ) -> Optional[Any]:
+        """
+        Evaluate application lifecycle before invoking the
+        decision engine.
+
+        Lifecycle handling is opt-in through the constructor so
+        existing callers that do not provide a lifecycle object
+        retain their previous behavior.
+        """
+        if self.application_lifecycle is None:
+            return None
+
+        job = ranked_result.get("job")
+
+        if not isinstance(job, Mapping):
+            return None
+
+        return self.application_lifecycle.evaluate(
+            dict(job)
+        )
+
+    @staticmethod
+    def _lifecycle_result(
+        ranked_result: Mapping[str, Any],
+        action: Any,
+        *,
+        success: bool,
+        decision: str,
+        status: str,
+        requires_human_action: bool = False,
+    ) -> ExecutionResult:
+        """
+        Convert a lifecycle action into an ExecutionResult
+        without invoking the application router.
+        """
+        job = ranked_result.get("job")
+
+        if not isinstance(job, Mapping):
+            job = {}
+
+        metadata = {
+            "lifecycle_action": getattr(
+                action,
+                "action",
+                "",
+            ),
+            "history_status": getattr(
+                action,
+                "status",
+                "",
+            ),
+            "eligible": bool(
+                getattr(
+                    action,
+                    "eligible",
+                    False,
+                )
+            ),
+        }
+
+        due_at = getattr(
+            action,
+            "due_at",
+            None,
+        )
+
+        if due_at is not None:
+            metadata["due_at"] = due_at
+
+        action_metadata = getattr(
+            action,
+            "metadata",
+            None,
+        )
+
+        if isinstance(
+            action_metadata,
+            Mapping,
+        ):
+            metadata.update(
+                dict(action_metadata)
+            )
+
+        return ExecutionResult(
+            success=success,
+            decision=decision,
+            status=status,
+            message=str(
+                getattr(
+                    action,
+                    "reason",
+                    "",
+                )
+            ),
+            job=dict(job),
+            ranking_score=JobAgentService._score(
+                ranked_result
+            ),
+            requires_human_action=(
+                requires_human_action
+            ),
+            metadata=metadata,
+        )
+
+    # ========================================================
     # INTERNAL EXECUTION
     # ========================================================
 
@@ -627,6 +747,80 @@ class JobAgentService:
             )
 
         # ----------------------------------------------------
+        # LIFECYCLE
+        # ----------------------------------------------------
+        lifecycle_action = self._evaluate_lifecycle(
+            ranked_result
+        )
+
+        if lifecycle_action is not None:
+            lifecycle_action_name = str(
+                getattr(
+                    lifecycle_action,
+                    "action",
+                    "",
+                )
+            ).strip().lower()
+
+            if lifecycle_action_name == "human_action":
+                return self._lifecycle_result(
+                    ranked_result,
+                    lifecycle_action,
+                    success=False,
+                    decision="review",
+                    status="human_action_required",
+                    requires_human_action=True,
+                )
+
+            if lifecycle_action_name == "closed":
+                return self._lifecycle_result(
+                    ranked_result,
+                    lifecycle_action,
+                    success=True,
+                    decision="skip",
+                    status="closed",
+                )
+
+            if lifecycle_action_name == "wait_retry":
+                return self._lifecycle_result(
+                    ranked_result,
+                    lifecycle_action,
+                    success=True,
+                    decision="skip",
+                    status="retry_waiting",
+                )
+
+            if lifecycle_action_name == "retry_exhausted":
+                return self._lifecycle_result(
+                    ranked_result,
+                    lifecycle_action,
+                    success=True,
+                    decision="skip",
+                    status="retry_exhausted",
+                )
+
+            if lifecycle_action_name == "review":
+                return self._lifecycle_result(
+                    ranked_result,
+                    lifecycle_action,
+                    success=False,
+                    decision="review",
+                    status="lifecycle_review_required",
+                    requires_human_action=True,
+                )
+
+            if lifecycle_action_name == "follow_up":
+                blocking_record = self._history_blocking_record(
+                    ranked_result
+                )
+
+                if blocking_record is not None:
+                    return self._duplicate_result(
+                        ranked_result,
+                        blocking_record,
+                    )
+
+        # ----------------------------------------------------
         # DUPLICATE PREVENTION
         # ----------------------------------------------------
         blocking_record = self._history_blocking_record(
@@ -764,6 +958,87 @@ class JobAgentService:
                     continue
 
                 # ------------------------------------------------
+                # LIFECYCLE
+                # ------------------------------------------------
+
+                lifecycle_action = (
+                    self._evaluate_lifecycle(
+                        ranked_result
+                    )
+                )
+
+                if lifecycle_action is not None:
+                    lifecycle_action_name = str(
+                        getattr(
+                            lifecycle_action,
+                            "action",
+                            "",
+                        )
+                    ).strip().lower()
+
+                    if lifecycle_action_name == "human_action":
+                        results.append(
+                            self._lifecycle_result(
+                                ranked_result,
+                                lifecycle_action,
+                                success=False,
+                                decision="review",
+                                status="human_action_required",
+                                requires_human_action=True,
+                            )
+                        )
+                        continue
+
+                    if lifecycle_action_name == "closed":
+                        results.append(
+                            self._lifecycle_result(
+                                ranked_result,
+                                lifecycle_action,
+                                success=True,
+                                decision="skip",
+                                status="closed",
+                            )
+                        )
+                        continue
+
+                    if lifecycle_action_name == "wait_retry":
+                        results.append(
+                            self._lifecycle_result(
+                                ranked_result,
+                                lifecycle_action,
+                                success=True,
+                                decision="skip",
+                                status="retry_waiting",
+                            )
+                        )
+                        continue
+
+                    if lifecycle_action_name == "retry_exhausted":
+                        results.append(
+                            self._lifecycle_result(
+                                ranked_result,
+                                lifecycle_action,
+                                success=True,
+                                decision="skip",
+                                status="retry_exhausted",
+                            )
+                        )
+                        continue
+
+                    if lifecycle_action_name == "review":
+                        results.append(
+                            self._lifecycle_result(
+                                ranked_result,
+                                lifecycle_action,
+                                success=False,
+                                decision="review",
+                                status="lifecycle_review_required",
+                                requires_human_action=True,
+                            )
+                        )
+                        continue
+
+                # ------------------------------------------------
                 # DECIDE EXACTLY ONCE
                 # ------------------------------------------------
 
@@ -840,12 +1115,6 @@ class JobAgentService:
                         dry_run=dry_run,
                         **provider_options,
                     )
-                )
-
-                self._record_execution_history(
-                    ranked_result,
-                    decision,
-                    result,
                 )
 
                 results.append(
