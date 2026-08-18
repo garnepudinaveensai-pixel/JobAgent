@@ -209,6 +209,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    run_parser.add_argument(
+        "--keep-browser-open",
+        action="store_true",
+        help=(
+            "Keep the browser open after the run for manual inspection. "
+            "Press Enter in the terminal to close it."
+        ),
+    )
+
     run_parser.set_defaults(
         handler=handle_run,
     )
@@ -586,7 +595,7 @@ def handle_run(args) -> int:
         print(f"Run failed: {exc}")
         return 1
     finally:
-        if browser is not None:
+        if browser is not None and not getattr(args, "keep_browser_open", False):
             try:
                 browser.close()
             except Exception:
@@ -608,6 +617,25 @@ def handle_run(args) -> int:
         "Human action required: "
         f"{data.get('human_action_required_count', 0)}"
     )
+
+    diagnostics = (
+        data.get("metadata", {}) or {}
+    ).get("source_diagnostics", []) or []
+
+    if diagnostics:
+        print()
+        print("SOURCE DIAGNOSTICS")
+        print("-" * 60)
+        for diagnostic in diagnostics:
+            source = diagnostic.get("source", "unknown")
+            status = diagnostic.get("status", "unknown")
+            jobs = diagnostic.get("jobs", 0)
+            error = diagnostic.get("error")
+            print(f"{source}: {status} | jobs={jobs}")
+            if error:
+                print(f"   {error}")
+            if diagnostic.get("requires_human_action"):
+                print("   HUMAN ACTION REQUIRED")
 
     executions = data.get("executions", []) or []
     if executions:
@@ -648,6 +676,15 @@ def handle_run(args) -> int:
         print(
             "LIVE execution was explicitly enabled with --execute."
         )
+
+    if getattr(args, "keep_browser_open", False) and browser is not None:
+        try:
+            input("Browser is still open. Press Enter to close it... ")
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     # JobAgent's run result intentionally remains successful when
     # individual jobs fail; those failures are exposed in errors.

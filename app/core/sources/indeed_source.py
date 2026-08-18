@@ -33,6 +33,7 @@ class IndeedSource(JobSource):
             if browser is not None
             else None
         )
+        self.last_diagnostic: dict = {}
 
     # ========================================================
     # SEARCH
@@ -72,9 +73,10 @@ class IndeedSource(JobSource):
             location=location,
         )
 
-        return self._normalize_jobs(
-            jobs
+        self.last_diagnostic = dict(
+            getattr(self.discovery, "last_diagnostic", {})
         )
+        return self._normalize_jobs(jobs)
 
     # ========================================================
     # NORMALIZATION
@@ -148,6 +150,13 @@ class IndeedSource(JobSource):
             )
 
         return normalized
+
+    # ========================================================
+    # OPTIONS
+    # ========================================================
+
+    def get_supported_options(self) -> set[str]:
+        return {"board_url"}
 
     # ========================================================
     # AVAILABILITY

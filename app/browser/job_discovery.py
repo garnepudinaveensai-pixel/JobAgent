@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from app.browser.browser_manager import BrowserManager
 from app.browser.sites.greenhouse import GreenhouseSite
@@ -42,6 +42,7 @@ class JobDiscovery:
             )
 
         self.browser = browser
+        self.last_diagnostic: dict[str, Any] = {}
 
     # ========================================================
     # GREENHOUSE
@@ -69,15 +70,41 @@ class JobDiscovery:
             location=location,
         )
 
-        return self._normalize_discovered_jobs(
+        jobs = self._normalize_discovered_jobs(
             site.get_job_listings()
         )
+
+        jobs = self._filter_location(
+            jobs,
+            location,
+        )
+
+        self.last_diagnostic = {
+            "source": "greenhouse",
+            "status": "ok" if jobs else "no_results",
+            "jobs": len(jobs),
+            "error": (
+                None
+                if jobs
+                else "No usable Greenhouse listings were extracted."
+            ),
+            "code": (
+                "ok"
+                if jobs
+                else "no_results"
+            ),
+            "requires_human_action": False,
+        }
+
+        return jobs
 
     def get_greenhouse_job_details(
         self,
         job_url: str,
     ) -> dict:
-        self._validate_job_url(job_url)
+        self._validate_job_url(
+            job_url
+        )
 
         page = self.browser.open(
             job_url.strip()
@@ -119,16 +146,37 @@ class JobDiscovery:
             site.get_job_listings()
         )
 
-        return self._filter_location(
+        jobs = self._filter_location(
             jobs,
             location,
         )
+
+        self.last_diagnostic = {
+            "source": "lever",
+            "status": "ok" if jobs else "no_results",
+            "jobs": len(jobs),
+            "error": (
+                None
+                if jobs
+                else "No usable Lever listings were extracted."
+            ),
+            "code": (
+                "ok"
+                if jobs
+                else "no_results"
+            ),
+            "requires_human_action": False,
+        }
+
+        return jobs
 
     def get_lever_job_details(
         self,
         job_url: str,
     ) -> dict:
-        self._validate_job_url(job_url)
+        self._validate_job_url(
+            job_url
+        )
 
         page = self.browser.open(
             job_url.strip()
@@ -170,16 +218,37 @@ class JobDiscovery:
             site.get_job_listings()
         )
 
-        return self._filter_location(
+        jobs = self._filter_location(
             jobs,
             location,
         )
+
+        self.last_diagnostic = {
+            "source": "workday",
+            "status": "ok" if jobs else "no_results",
+            "jobs": len(jobs),
+            "error": (
+                None
+                if jobs
+                else "No usable Workday listings were extracted."
+            ),
+            "code": (
+                "ok"
+                if jobs
+                else "no_results"
+            ),
+            "requires_human_action": False,
+        }
+
+        return jobs
 
     def get_workday_job_details(
         self,
         job_url: str,
     ) -> dict:
-        self._validate_job_url(job_url)
+        self._validate_job_url(
+            job_url
+        )
 
         page = self.browser.open(
             job_url.strip()
@@ -206,12 +275,21 @@ class JobDiscovery:
                 "keywords cannot be empty."
             )
 
+        # IMPORTANT:
+        # Import lazily to avoid circular import during
+        # app.core.sources package initialization.
+        from app.core.sources.job_source import (
+            SourceAccessError,
+        )
+
+        start_url = (
+            board_url.strip()
+            if board_url
+            else "https://www.naukri.com/"
+        )
+
         page = self.browser.open(
-            (
-                board_url.strip()
-                if board_url
-                else "https://www.naukri.com/"
-            )
+            start_url
         )
 
         site = NaukriSite(page)
@@ -221,20 +299,76 @@ class JobDiscovery:
             location=location,
         )
 
+        state = site.get_access_state()
+
+        if state["blocked"]:
+            self.last_diagnostic = {
+                "source": "naukri",
+                "status": "blocked",
+                "jobs": 0,
+                "error": state["message"],
+                "code": state["code"],
+                "requires_human_action": (
+                    state[
+                        "requires_human_action"
+                    ]
+                ),
+                "url": site.get_current_url(),
+            }
+
+            raise SourceAccessError(
+                state["message"],
+                code=state["code"],
+                requires_human_action=(
+                    state[
+                        "requires_human_action"
+                    ]
+                ),
+            )
+
         jobs = self._normalize_discovered_jobs(
             site.get_job_listings()
         )
 
-        return self._filter_location(
+        jobs = self._filter_location(
             jobs,
             location,
         )
+
+        self.last_diagnostic = {
+            "source": "naukri",
+            "status": (
+                "ok"
+                if jobs
+                else "no_results"
+            ),
+            "jobs": len(jobs),
+            "error": (
+                None
+                if jobs
+                else (
+                    "No publicly accessible "
+                    "Naukri listings were extracted."
+                )
+            ),
+            "code": (
+                "ok"
+                if jobs
+                else "no_results"
+            ),
+            "requires_human_action": False,
+            "url": site.get_current_url(),
+        }
+
+        return jobs
 
     def get_naukri_job_details(
         self,
         job_url: str,
     ) -> dict:
-        self._validate_job_url(job_url)
+        self._validate_job_url(
+            job_url
+        )
 
         page = self.browser.open(
             job_url.strip()
@@ -257,11 +391,11 @@ class JobDiscovery:
         location: Optional[str] = None,
     ) -> list[dict]:
         """
-        Discover jobs from publicly accessible Indeed.
+        Discover publicly accessible Indeed listings.
 
-        board_url is optional. If supplied, it is used as the
-        starting page; otherwise Indeed's public search URL
-        is used by the site adapter.
+        If Indeed presents a verification or anti-bot page,
+        report it as blocked instead of incorrectly returning
+        an empty job list.
         """
 
         if not keywords or not keywords.strip():
@@ -269,10 +403,17 @@ class JobDiscovery:
                 "keywords cannot be empty."
             )
 
+        # IMPORTANT:
+        # Import lazily to avoid circular import during
+        # app.core.sources package initialization.
+        from app.core.sources.job_source import (
+            SourceAccessError,
+        )
+
         start_url = (
             board_url.strip()
             if board_url
-            else "https://www.indeed.com/"
+            else "https://in.indeed.com/"
         )
 
         page = self.browser.open(
@@ -286,20 +427,76 @@ class JobDiscovery:
             location=location,
         )
 
+        state = site.get_access_state()
+
+        if state["blocked"]:
+            self.last_diagnostic = {
+                "source": "indeed",
+                "status": "blocked",
+                "jobs": 0,
+                "error": state["message"],
+                "code": state["code"],
+                "requires_human_action": (
+                    state[
+                        "requires_human_action"
+                    ]
+                ),
+                "url": site.get_current_url(),
+            }
+
+            raise SourceAccessError(
+                state["message"],
+                code=state["code"],
+                requires_human_action=(
+                    state[
+                        "requires_human_action"
+                    ]
+                ),
+            )
+
         jobs = self._normalize_discovered_jobs(
             site.get_job_listings()
         )
 
-        return self._filter_location(
+        jobs = self._filter_location(
             jobs,
             location,
         )
+
+        self.last_diagnostic = {
+            "source": "indeed",
+            "status": (
+                "ok"
+                if jobs
+                else "no_results"
+            ),
+            "jobs": len(jobs),
+            "error": (
+                None
+                if jobs
+                else (
+                    "No publicly accessible "
+                    "Indeed listings were extracted."
+                )
+            ),
+            "code": (
+                "ok"
+                if jobs
+                else "no_results"
+            ),
+            "requires_human_action": False,
+            "url": site.get_current_url(),
+        }
+
+        return jobs
 
     def get_indeed_job_details(
         self,
         job_url: str,
     ) -> dict:
-        self._validate_job_url(job_url)
+        self._validate_job_url(
+            job_url
+        )
 
         page = self.browser.open(
             job_url.strip()
@@ -353,35 +550,57 @@ class JobDiscovery:
             return normalized
 
         for job in jobs:
-            if not isinstance(job, dict):
+            if not isinstance(
+                job,
+                dict,
+            ):
                 continue
 
             normalized.append(
                 {
                     "title": str(
-                        job.get("title", "")
+                        job.get(
+                            "title",
+                            "",
+                        )
                         or ""
                     ).strip(),
                     "company": str(
-                        job.get("company", "")
+                        job.get(
+                            "company",
+                            "",
+                        )
                         or ""
                     ).strip(),
                     "location": str(
-                        job.get("location", "")
+                        job.get(
+                            "location",
+                            "",
+                        )
                         or ""
                     ).strip(),
                     "url": str(
-                        job.get("url", "")
+                        job.get(
+                            "url",
+                            "",
+                        )
                         or ""
                     ).strip(),
                     "description": str(
-                        job.get("description", "")
+                        job.get(
+                            "description",
+                            "",
+                        )
                         or ""
                     ).strip(),
                 }
             )
 
         return normalized
+
+    # ========================================================
+    # LOCATION FILTER
+    # ========================================================
 
     @staticmethod
     def _filter_location(
@@ -393,14 +612,25 @@ class JobDiscovery:
 
         requested = location.strip().lower()
 
-        return [
-            job
-            for job in jobs
-            if (
-                not job.get("location")
-                or requested
-                in str(
-                    job.get("location", "")
-                ).lower()
-            )
-        ]
+        filtered: list[dict] = []
+
+        for job in jobs:
+            job_location = str(
+                job.get(
+                    "location",
+                    "",
+                )
+                or ""
+            ).strip().lower()
+
+            # Preserve jobs where the source did not provide
+            # a location. This avoids throwing away potentially
+            # useful public listings with incomplete metadata.
+            if not job_location:
+                filtered.append(job)
+                continue
+
+            if requested in job_location:
+                filtered.append(job)
+
+        return filtered

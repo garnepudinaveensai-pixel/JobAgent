@@ -100,6 +100,9 @@ class AgentRunner:
         # Backward compatibility with the older JobAgent API.
         self.job_agent = job_agent
 
+        # Diagnostics from the most recent multi-source discovery run.
+        self.last_source_diagnostics: list[dict] = []
+
     # ========================================================
     # CONFIG
     # ========================================================
@@ -246,17 +249,23 @@ class AgentRunner:
                 "keywords cannot be empty."
             )
 
-        jobs = (
-            self.job_source_manager.search(
-                keywords=keywords.strip(),
-                location=location,
-                **source_options,
-            )
+        jobs = self.job_source_manager.search(
+            keywords=keywords.strip(),
+            location=location,
+            **source_options,
         )
 
-        return self.deduplicator.deduplicate(
-            jobs
+        getter = getattr(
+            self.job_source_manager,
+            "get_diagnostics",
+            None,
         )
+        if callable(getter):
+            self.last_source_diagnostics = getter()
+        else:
+            self.last_source_diagnostics = []
+
+        return self.deduplicator.deduplicate(jobs)
 
     # ========================================================
     # MULTI-SOURCE DISCOVERY + MATCHING

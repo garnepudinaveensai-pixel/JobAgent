@@ -4,14 +4,23 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 
+class SourceAccessError(RuntimeError):
+    """Raised when a public source cannot be accessed safely."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "source_access_error",
+        requires_human_action: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.requires_human_action = requires_human_action
+
+
 class JobSource(ABC):
-    """
-    Common interface for every job source.
-
-    Every source returns normalized job dictionaries.
-
-    Sources may declare which source-specific options they support.
-    """
+    """Common interface for every job source."""
 
     name: str = "unknown"
 
@@ -22,46 +31,13 @@ class JobSource(ABC):
         location: Optional[str] = None,
         **options: Any,
     ) -> list[dict]:
-        """
-        Search for jobs using this source.
-
-        Args:
-            keywords:
-                Job search keywords.
-
-            location:
-                Optional location filter.
-
-            **options:
-                Source-specific search options.
-
-        Returns:
-            A list of normalized job dictionaries.
-        """
         raise NotImplementedError
 
     def is_available(self) -> bool:
-        """
-        Return whether this source is currently available.
-        """
         return True
 
-    def supports_option(
-        self,
-        option: str,
-    ) -> bool:
-        """
-        Return whether this source explicitly supports
-        a source-specific option.
-
-        By default, sources support no optional parameters.
-        Individual sources can override this method.
-        """
-        return False
+    def supports_option(self, option: str) -> bool:
+        return option in self.get_supported_options()
 
     def get_supported_options(self) -> set[str]:
-        """
-        Return the set of source-specific options supported
-        by this source.
-        """
         return set()

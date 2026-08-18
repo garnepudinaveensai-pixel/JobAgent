@@ -53,6 +53,10 @@ class NaukriSite(BaseJobSite):
             'input[placeholder*="Search"]',
             'input[placeholder*="search"]',
             'input[placeholder*="skills"]',
+            'input[placeholder*="Skills"]',
+            'input[placeholder*="designations"]',
+            'input[placeholder*="companies"]',
+            'input[placeholder*="Enter skills"]',
             'input[name="keyword"]',
             'input[name="keywords"]',
             'input[type="search"]',
@@ -88,11 +92,12 @@ class NaukriSite(BaseJobSite):
                         location.strip()
                     )
 
-                search_box.press(
-                    "Enter"
-                )
+                clicked = self._click_search_button()
+                if not clicked:
+                    search_box.press("Enter")
 
                 self.wait_for_page()
+                self._settle_page()
                 return
 
             except Exception:
@@ -116,6 +121,67 @@ class NaukriSite(BaseJobSite):
         )
 
         self.wait_for_page()
+        self._settle_page()
+
+    def _click_search_button(self) -> bool:
+        selectors = [
+            'button:has-text("Search")',
+            'input[type="submit"]',
+            'button[type="submit"]',
+        ]
+        for selector in selectors:
+            try:
+                locator = self.page.locator(selector).first
+                if locator.is_visible(timeout=1000):
+                    locator.click()
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _settle_page(self) -> None:
+        try:
+            self.page.wait_for_timeout(1200)
+        except Exception:
+            pass
+
+    def get_access_state(self) -> dict:
+        try:
+            url = self.get_current_url().lower()
+        except Exception:
+            url = ""
+        try:
+            title = self.get_title().lower()
+        except Exception:
+            title = ""
+        try:
+            body = self.page.locator("body").inner_text(timeout=3000).lower()
+        except Exception:
+            body = ""
+        text = f"{title} {url} {body}"
+        verification_terms = (
+            "captcha",
+            "verify you are human",
+            "access denied",
+            "unusual traffic",
+            "cloudflare",
+            "just a moment",
+            "additional verification",
+        )
+        matched = next((term for term in verification_terms if term in text), None)
+        if matched:
+            return {
+                "blocked": True,
+                "code": "verification_required",
+                "message": f"Naukri requires additional verification ({matched}).",
+                "requires_human_action": True,
+            }
+        return {
+            "blocked": False,
+            "code": "ok",
+            "message": "",
+            "requires_human_action": False,
+        }
 
     def _fill_location(
         self,
@@ -127,6 +193,8 @@ class NaukriSite(BaseJobSite):
 
         selectors = [
             'input[placeholder*="Location"]',
+            'input[placeholder*="location"]',
+            'input[placeholder*="Enter location"]',
             'input[placeholder*="location"]',
             'input[name="location"]',
             'input[name="locations"]',
@@ -178,6 +246,9 @@ class NaukriSite(BaseJobSite):
             ".jobTuple",
             ".cust-job-tuple",
             "[data-job-id]",
+            "div[data-job-id]",
+            "div[class*=jobTuple]",
+            "div[class*=job-tuple]",
         ]
 
         cards = None
@@ -232,7 +303,7 @@ class NaukriSite(BaseJobSite):
 
         # Generic fallback for publicly visible job links.
         links = self.page.locator(
-            'a[href*="/job-listings-"]'
+            'a[href*="/job-listings-"], a[href*="/job-listings/"]'
         )
 
         for index in range(
@@ -246,10 +317,9 @@ class NaukriSite(BaseJobSite):
                 ):
                     continue
 
-                title = (
-                    link.inner_text()
-                    .strip()
-                )
+                title = (link.inner_text() or "").strip()
+                if not title:
+                    title = (link.get_attribute("aria-label") or link.get_attribute("title") or "").strip()
 
                 href = (
                     link.get_attribute(
@@ -298,6 +368,8 @@ class NaukriSite(BaseJobSite):
             card,
             [
                 ".title",
+                ".jobTitle",
+                "[class*=jobTitle]",
                 ".jobTitle",
                 "a.title",
                 "h2",

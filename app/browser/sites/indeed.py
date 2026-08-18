@@ -98,7 +98,7 @@ class IndeedSite(BaseJobSite):
 
         # Public URL fallback.
         search_url = (
-            "https://www.indeed.com/jobs"
+            "https://in.indeed.com/jobs"
             f"?q={quote(keyword)}"
         )
 
@@ -113,6 +113,51 @@ class IndeedSite(BaseJobSite):
         )
 
         self.wait_for_page()
+        self._settle_page()
+
+    # ========================================================
+    # ACCESS STATE
+    # ========================================================
+
+    def get_access_state(self) -> dict:
+        """Detect public verification/block pages without bypassing them."""
+        try:
+            url = self.get_current_url().lower()
+        except Exception:
+            url = ""
+        try:
+            title = self.get_title().lower()
+        except Exception:
+            title = ""
+        try:
+            body = self.page.locator("body").inner_text(timeout=3000).lower()
+        except Exception:
+            body = ""
+
+        text = f"{title} {url} {body}"
+        verification_terms = (
+            "additional verification required",
+            "cloudflare",
+            "verify you are human",
+            "captcha",
+            "just a moment",
+            "access denied",
+            "unusual traffic",
+        )
+        matched = next((term for term in verification_terms if term in text), None)
+        if matched:
+            return {
+                "blocked": True,
+                "code": "verification_required",
+                "message": f"Indeed requires additional verification ({matched}).",
+                "requires_human_action": True,
+            }
+        return {
+            "blocked": False,
+            "code": "ok",
+            "message": "",
+            "requires_human_action": False,
+        }
 
     # ========================================================
     # LISTINGS
@@ -130,6 +175,8 @@ class IndeedSite(BaseJobSite):
             "div.cardOutline",
             "td.resultContent",
             "[data-jk]",
+            'li[data-testid="slider_item"]',
+            'div[data-testid="slider_item"]',
         ]
 
         cards = None
@@ -185,7 +232,9 @@ class IndeedSite(BaseJobSite):
 
         # Generic public Indeed job links.
         links = self.page.locator(
-            'a[href*="/viewjob"]'
+            'a[href*="/viewjob"]',
+            'a[href*="/rc/clk"]',
+            'a[href*="/pagead/clk"]'
         )
 
         for index in range(
@@ -199,10 +248,9 @@ class IndeedSite(BaseJobSite):
                 ):
                     continue
 
-                title = (
-                    link.inner_text()
-                    .strip()
-                )
+                title = (link.inner_text() or "").strip()
+                if not title:
+                    title = (link.get_attribute("aria-label") or link.get_attribute("title") or "").strip()
 
                 href = (
                     link.get_attribute(
@@ -488,6 +536,12 @@ class IndeedSite(BaseJobSite):
             "https://www.indeed.com",
             href,
         )
+
+    def _settle_page(self) -> None:
+        try:
+            self.page.wait_for_timeout(1200)
+        except Exception:
+            pass
 
     # ========================================================
     # WAIT
