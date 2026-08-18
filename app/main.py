@@ -78,7 +78,13 @@ def create_runner(
     from app.browser.browser_manager import BrowserManager
 
     browser = BrowserManager(
-        headless=False,
+        headless=config.browser.headless,
+        timeout=config.browser.timeout,
+        persistent_profile_dir=(
+            config.browser.profile_directory
+            if config.browser.persistent
+            else None
+        ),
     )
 
     # --------------------------------------------------------
@@ -330,8 +336,8 @@ def create_end_to_end_pipeline(
     Hunter is automatically available when
     HUNTER_API_KEY is configured.
 
-    Email sending remains confirmation-gated and the
-    default EmailSender is dry-run.
+    Email sending is wired to the configured SMTP sender, but remains
+    confirmation-gated by the execution router.
     """
 
     if config is None:
@@ -355,9 +361,15 @@ def create_end_to_end_pipeline(
         HunterProvider,
     )
 
+    from app.outreach.job_posting_provider import (
+        JobPostingContactProvider,
+    )
+
     from app.outreach.outreach_pipeline import (
         OutreachPipeline,
     )
+
+    from app.outreach.email_sender import EmailSender
 
     from app.outreach.outreach_tracker import (
         OutreachTracker,
@@ -365,14 +377,19 @@ def create_end_to_end_pipeline(
 
     contact_discovery = ContactDiscovery(
         providers=[
+            JobPostingContactProvider(),
             HunterProvider(),
         ]
     )
 
     outreach_tracker = OutreachTracker()
 
+    # The pipeline is wired to a real SMTP sender here, but the execution
+    # router still prevents sending unless the caller explicitly uses
+    # --execute (confirm=True). Dry-run therefore remains safe.
     outreach_pipeline = OutreachPipeline(
         outreach_tracker=outreach_tracker,
+        email_sender=EmailSender(dry_run=False),
     )
 
     return EndToEndPipeline(

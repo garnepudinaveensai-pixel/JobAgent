@@ -210,6 +210,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     run_parser.add_argument(
+        "--outreach-after-apply",
+        action="store_true",
+        help=(
+            "After a successful application, also prepare/send recruiter outreach "
+            "for the same job. Sending still requires --execute."
+        ),
+    )
+
+    run_parser.add_argument(
         "--keep-browser-open",
         action="store_true",
         help=(
@@ -220,6 +229,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser.set_defaults(
         handler=handle_run,
+    )
+
+    # ========================================================
+    # LOGIN / SESSION SETUP
+    # ========================================================
+
+    login_parser = subparsers.add_parser(
+        "login",
+        help=(
+            "Open a persistent browser profile so you can log in once "
+            "to job sites. Cookies/session state are reused later."
+        ),
+    )
+
+    login_parser.add_argument(
+        "--sites",
+        default="naukri,indeed,linkedin",
+        help=(
+            "Comma-separated sites to open. Supported defaults: "
+            "naukri, indeed, linkedin. You may also provide URLs "
+            "through --urls."
+        ),
+    )
+
+    login_parser.add_argument(
+        "--urls",
+        default=None,
+        help=(
+            "Optional comma-separated URLs to open in the same persistent "
+            "profile."
+        ),
+    )
+
+    login_parser.set_defaults(
+        handler=handle_login,
     )
 
     # ========================================================
@@ -307,6 +351,16 @@ def handle_config(args) -> int:
     print(
         f"Auto-submit: "
         f"{config.application.auto_submit}"
+    )
+
+    print(
+        f"Persistent browser profile: "
+        f"{config.browser.persistent}"
+    )
+
+    print(
+        f"Browser profile directory: "
+        f"{config.browser.profile_directory}"
     )
 
     print(
@@ -558,6 +612,10 @@ def handle_run(args) -> int:
         "Outreach preparation: "
         f"{'disabled' if args.no_outreach else 'enabled'}"
     )
+    print(
+        "Outreach after apply: "
+        f"{'enabled' if args.outreach_after_apply and not args.no_outreach else 'disabled'}"
+    )
     print()
 
     service = None
@@ -588,6 +646,10 @@ def handle_run(args) -> int:
             page_factory=page_factory,
             confirm=bool(args.execute),
             dry_run=not bool(args.execute),
+            also_outreach=(
+                bool(args.outreach_after_apply)
+                and not bool(args.no_outreach)
+            ),
             **source_options,
         )
 
@@ -689,6 +751,93 @@ def handle_run(args) -> int:
     # JobAgent's run result intentionally remains successful when
     # individual jobs fail; those failures are exposed in errors.
     return 0 if data.get("success", False) else 1
+
+
+# ============================================================
+# LOGIN / SESSION HANDLER
+# ============================================================
+
+
+def handle_login(args) -> int:
+    """Open the persistent JobAgent browser profile for one-time logins."""
+
+    site_urls = {
+        "naukri": "https://www.naukri.com/",
+        "indeed": "https://in.indeed.com/",
+        "linkedin": "https://www.linkedin.com/",
+        "foundit": "https://www.foundit.in/",
+        "shine": "https://www.shine.com/",
+        "glassdoor": "https://www.glassdoor.co.in/",
+    }
+
+    config = create_default_config()
+    config.ensure_directories()
+
+    requested_urls = []
+
+    if args.urls:
+        requested_urls.extend(
+            value.strip()
+            for value in str(args.urls).split(",")
+            if value.strip()
+        )
+
+    if args.sites:
+        for name in str(args.sites).split(","):
+            key = name.strip().lower()
+            if not key:
+                continue
+            url = site_urls.get(key)
+            if url:
+                requested_urls.append(url)
+            else:
+                print(
+                    f"Unknown site '{key}'. Use --urls for a custom site URL."
+                )
+
+    # Preserve order while removing duplicate URLs.
+    requested_urls = list(dict.fromkeys(requested_urls))
+
+    if not requested_urls:
+        print("No valid sites or URLs were supplied.")
+        return 2
+
+    from app.browser.browser_manager import BrowserManager
+
+    browser = BrowserManager(
+        headless=False,
+        timeout=config.browser.timeout,
+        persistent_profile_dir=config.browser.profile_directory,
+    )
+
+    print("=" * 60)
+    print("JobAgent Persistent Login Setup")
+    print("=" * 60)
+    print(f"Profile: {browser.profile_directory}")
+    print()
+    print("Log in manually in the opened browser windows.")
+    print("Do not give JobAgent your passwords or OTPs.")
+    print("CAPTCHA/verification must always be completed by you.")
+    print()
+
+    try:
+        browser.start()
+
+        for url in requested_urls:
+            try:
+                page = browser.open(url)
+                print(f"Opened: {url}")
+                print(f"Current URL: {page.url}")
+            except Exception as exc:
+                print(f"Could not open {url}: {exc}")
+
+        input(
+            "\nAfter you finish logging in, press Enter to save the session and close the browser... "
+        )
+        return 0
+
+    finally:
+        browser.close()
 
 
 # ============================================================

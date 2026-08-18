@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Generator, Optional
 from urllib.parse import urlparse
 
@@ -15,62 +18,78 @@ class BrowserManager:
     """
     Centralized Playwright browser manager for JobAgent.
 
-    Responsibilities:
-    - Start and stop Playwright safely.
-    - Launch Chromium.
-    - Reuse one browser instance.
-    - Reuse one browser context during a session.
-    - Create multiple pages when required.
-    - Apply consistent timeouts.
-    - Validate URLs before navigation.
-    - Clean up resources reliably.
+    The manager supports two modes:
+
+    1. Ephemeral browser context (default for tests and isolated runs).
+    2. Persistent Chromium profile when ``persistent_profile_dir`` is set.
+
+    A persistent profile is the important part for real JobAgent use:
+    cookies, local storage and site sessions survive browser restarts.
+    The user logs in manually once; later JobAgent runs reuse the same
+    profile instead of asking for credentials every time.
+
+    JobAgent never stores site passwords and never attempts to bypass
+    CAPTCHA, OTP or other human-verification mechanisms.
     """
 
     def __init__(
         self,
         headless: bool = False,
         timeout: int = 30000,
+        persistent_profile_dir: Optional[str] = None,
     ):
         if timeout <= 0:
-            raise ValueError(
-                "timeout must be greater than 0."
-            )
+            raise ValueError("timeout must be greater than 0.")
 
-        self.headless = headless
+        self.headless = bool(headless)
         self.timeout = timeout
+        self.persistent_profile_dir = (
+            str(persistent_profile_dir).strip()
+            if persistent_profile_dir is not None
+            else None
+        ) or None
 
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        self._persistent_context = False
 
     # ========================================================
     # START
     # ========================================================
 
     def start(self) -> "BrowserManager":
-        """
-        Start Playwright and launch Chromium.
+        """Start Playwright and create the configured browser context."""
 
-        Calling start() multiple times is safe.
-        The existing browser instance is reused.
-        """
-
-        if self._browser is not None:
+        if self._context is not None:
             return self
 
         try:
             self._playwright = sync_playwright().start()
 
-            self._browser = self._playwright.chromium.launch(
-                headless=self.headless,
-            )
+            if self.persistent_profile_dir:
+                profile = Path(self.persistent_profile_dir).expanduser()
+                profile.mkdir(parents=True, exist_ok=True)
+
+                self._context = self._playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(profile.resolve()),
+                    headless=self.headless,
+                )
+                self._persistent_context = True
+                self._browser = getattr(self._context, "browser", None)
+            else:
+                self._browser = self._playwright.chromium.launch(
+                    headless=self.headless,
+                )
+                self._persistent_context = False
+
+            if self._context is not None:
+                self._configure_context(self._context)
 
             return self
 
         except Exception:
-            # If startup fails, clean up anything that may
-            # have been partially initialized.
             self.close()
             raise
 
@@ -78,33 +97,29 @@ class BrowserManager:
     # CONTEXT
     # ========================================================
 
+    def _configure_context(self, context: BrowserContext) -> None:
+        context.set_default_timeout(self.timeout)
+        context.set_default_navigation_timeout(self.timeout)
+
     def create_context(self) -> BrowserContext:
-        """
-        Create or reuse the active browser context.
-
-        The context is reused for the lifetime of the
-        BrowserManager session.
-
-        This preserves cookies, local storage, and session
-        state between pages.
-        """
-
-        if self._browser is None:
-            raise RuntimeError(
-                "BrowserManager is not started. "
-                "Call start() first."
-            )
+        """Create or reuse the active browser context."""
 
         if self._context is None:
+            if self._playwright is None and self._browser is None:
+                raise RuntimeError(
+                    "BrowserManager is not started. Call start() first."
+                )
+
+            # Defensive compatibility path for unusual callers that provide
+            # a browser object without going through start().
+            if self._browser is None:
+                raise RuntimeError(
+                    "BrowserManager is not started. Call start() first."
+                )
+
             self._context = self._browser.new_context()
-
-            self._context.set_default_timeout(
-                self.timeout,
-            )
-
-            self._context.set_default_navigation_timeout(
-                self.timeout,
-            )
+            self._persistent_context = False
+            self._configure_context(self._context)
 
         return self._context
 
@@ -113,16 +128,10 @@ class BrowserManager:
     # ========================================================
 
     def new_page(self) -> Page:
-        """
-        Create a new page inside the active browser context.
-
-        Multiple pages can now coexist during one session.
-        """
+        """Create a new page inside the active browser context."""
 
         context = self.create_context()
-
         self._page = context.new_page()
-
         return self._page
 
     # ========================================================
@@ -131,10 +140,6 @@ class BrowserManager:
 
     @property
     def page(self) -> Optional[Page]:
-        """
-        Return the most recently created page.
-        """
-
         return self._page
 
     # ========================================================
@@ -143,10 +148,6 @@ class BrowserManager:
 
     @property
     def browser(self) -> Optional[Browser]:
-        """
-        Return the active browser instance.
-        """
-
         return self._browser
 
     # ========================================================
@@ -155,11 +156,21 @@ class BrowserManager:
 
     @property
     def context(self) -> Optional[BrowserContext]:
-        """
-        Return the active browser context.
-        """
-
         return self._context
+
+    # ========================================================
+    # PROFILE
+    # ========================================================
+
+    @property
+    def is_persistent(self) -> bool:
+        return self._persistent_context
+
+    @property
+    def profile_directory(self) -> Optional[str]:
+        if not self.persistent_profile_dir:
+            return None
+        return str(Path(self.persistent_profile_dir).expanduser().resolve())
 
     # ========================================================
     # URL VALIDATION
@@ -167,60 +178,37 @@ class BrowserManager:
 
     @staticmethod
     def _validate_url(url: str) -> None:
-        """
-        Validate that a URL is a usable HTTP/HTTPS URL.
-        """
-
         if not isinstance(url, str):
-            raise ValueError(
-                "URL must be a string."
-            )
+            raise ValueError("URL must be a string.")
 
         url = url.strip()
-
         if not url:
-            raise ValueError(
-                "URL cannot be empty."
-            )
+            raise ValueError("URL cannot be empty.")
 
         parsed = urlparse(url)
-
-        if parsed.scheme not in {
-            "http",
-            "https",
-        }:
-            raise ValueError(
-                "URL must use http:// or https://."
-            )
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError("URL must use http:// or https://.")
 
         if not parsed.netloc:
-            raise ValueError(
-                "URL must contain a valid hostname."
-            )
+            raise ValueError("URL must contain a valid hostname.")
 
     # ========================================================
     # NAVIGATION
     # ========================================================
 
     def open(self, url: str) -> Page:
-        """
-        Open a URL in a new page.
-
-        The browser is started automatically if necessary.
-        """
+        """Open a URL in a new page using the active session/profile."""
 
         self._validate_url(url)
 
-        if self._browser is None:
+        if self._context is None:
             self.start()
 
         page = self.new_page()
-
         page.goto(
             url.strip(),
             wait_until="domcontentloaded",
         )
-
         return page
 
     # ========================================================
@@ -228,15 +216,7 @@ class BrowserManager:
     # ========================================================
 
     def close_page(self, page: Optional[Page] = None) -> None:
-        """
-        Close one page without shutting down the entire
-        browser session.
-
-        If no page is supplied, close the current page.
-        """
-
         target = page or self._page
-
         if target is None:
             return
 
@@ -253,19 +233,7 @@ class BrowserManager:
     # ========================================================
 
     def close(self) -> None:
-        """
-        Safely close all Playwright resources.
-
-        Cleanup order:
-
-            page
-              ↓
-            context
-              ↓
-            browser
-              ↓
-            Playwright
-        """
+        """Safely close Playwright resources."""
 
         self.close_page()
 
@@ -274,46 +242,35 @@ class BrowserManager:
                 self._context.close()
             except Exception:
                 pass
-
             self._context = None
 
-        if self._browser is not None:
+        # A persistent context owns the Chromium instance. Do not call
+        # browser.close() separately in that mode.
+        if self._browser is not None and not self._persistent_context:
             try:
                 self._browser.close()
             except Exception:
                 pass
 
-            self._browser = None
+        self._browser = None
 
         if self._playwright is not None:
             try:
                 self._playwright.stop()
             except Exception:
                 pass
-
             self._playwright = None
+
+        self._persistent_context = False
 
     # ========================================================
     # CONTEXT MANAGER
     # ========================================================
 
     def __enter__(self) -> "BrowserManager":
-        """
-        Start the browser when entering a with-block.
-        """
-
         return self.start()
 
-    def __exit__(
-        self,
-        exc_type,
-        exc_value,
-        traceback,
-    ) -> None:
-        """
-        Always clean up browser resources.
-        """
-
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
 
 
@@ -321,28 +278,18 @@ class BrowserManager:
 def browser_session(
     headless: bool = False,
     timeout: int = 30000,
+    persistent_profile_dir: Optional[str] = None,
 ) -> Generator[BrowserManager, None, None]:
-    """
-    Convenience context manager for a complete browser session.
-
-    Example:
-
-        with browser_session() as browser:
-            page = browser.open(
-                "https://example.com"
-            )
-
-    The browser is automatically closed when the block ends.
-    """
+    """Convenience context manager for a complete browser session."""
 
     manager = BrowserManager(
         headless=headless,
         timeout=timeout,
+        persistent_profile_dir=persistent_profile_dir,
     )
 
     try:
         manager.start()
         yield manager
-
     finally:
         manager.close()

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -10,20 +11,20 @@ from app.browser.base_site import BaseJobSite
 
 class NaukriSite(BaseJobSite):
     """
-    Naukri public job-search adapter.
+    Public Naukri job-search adapter.
 
-    Uses normal browser navigation and publicly accessible
-    job-search functionality.
+    The adapter intentionally uses the normal public job-search page and
+    ordinary DOM extraction. It does not bypass CAPTCHA/Cloudflare,
+    authentication, or other access controls, and it never submits an
+    application from the discovery layer.
 
-    Does NOT:
-        - bypass authentication
-        - bypass CAPTCHA
-        - bypass anti-bot protections
-        - bypass access restrictions
-        - submit applications
+    Naukri's search-result DOM changes periodically. For that reason the
+    listing extractor uses several generations of selectors plus a generic
+    public-job-link fallback instead of depending on one CSS class.
     """
 
     name = "Naukri"
+    BASE_URL = "https://www.naukri.com/"
 
     def __init__(self, page):
         super().__init__(page)
@@ -37,97 +38,93 @@ class NaukriSite(BaseJobSite):
         keywords: str,
         location: Optional[str] = None,
     ) -> None:
-        """
-        Search Naukri using the normal public search interface.
-        """
-
         if not keywords or not keywords.strip():
-            raise ValueError(
-                "keywords cannot be empty."
-            )
+            raise ValueError("keywords cannot be empty.")
 
         keyword = keywords.strip()
+        location_value = (location or "").strip()
 
-        # Try visible search controls first.
+        # Prefer the public search URL. Naukri may redirect this URL to its
+        # current SEO search route, which is exactly what a normal browser
+        # search does and is more reliable than depending on the current
+        # search-box implementation.
+        search_url = (
+            f"{self.BASE_URL}jobs-in-india"
+            f"?k={quote(keyword)}"
+        )
+        if location_value:
+            search_url += f"&l={quote(location_value)}"
+
+        try:
+            self.page.goto(
+                search_url,
+                wait_until="domcontentloaded",
+            )
+            self.wait_for_page()
+            self._wait_for_results()
+            return
+        except Exception:
+            # Fall back to the visible search controls if direct navigation
+            # was interrupted by a browser/navigation issue.
+            pass
+
+        self._search_using_controls(keyword, location_value)
+        self._wait_for_results()
+
+    def _search_using_controls(
+        self,
+        keyword: str,
+        location: str,
+    ) -> None:
         keyword_selectors = [
-            'input[placeholder*="Search"]',
-            'input[placeholder*="search"]',
             'input[placeholder*="skills"]',
             'input[placeholder*="Skills"]',
             'input[placeholder*="designations"]',
             'input[placeholder*="companies"]',
-            'input[placeholder*="Enter skills"]',
+            'input[placeholder*="Search"]',
+            'input[placeholder*="search"]',
             'input[name="keyword"]',
             'input[name="keywords"]',
             'input[type="search"]',
         ]
 
-        search_box = None
-
         for selector in keyword_selectors:
             try:
-                locator = (
-                    self.page.locator(
-                        selector
-                    ).first
-                )
+                locator = self.page.locator(selector).first
+                if not locator.is_visible(timeout=1000):
+                    continue
 
-                if locator.is_visible(
-                    timeout=1500
-                ):
-                    search_box = locator
-                    break
+                locator.fill(keyword)
+                if location:
+                    self._fill_location(location)
 
+                if not self._click_search_button():
+                    locator.press("Enter")
+
+                self.wait_for_page()
+                return
             except Exception:
                 continue
 
-        if search_box is not None:
-            try:
-                search_box.fill(
-                    keyword
-                )
-
-                if location and location.strip():
-                    self._fill_location(
-                        location.strip()
-                    )
-
-                clicked = self._click_search_button()
-                if not clicked:
-                    search_box.press("Enter")
-
-                self.wait_for_page()
-                self._settle_page()
-                return
-
-            except Exception:
-                pass
-
-        # Fallback to Naukri's public search URL.
+        # Last resort: direct URL again, without relying on page controls.
         search_url = (
-            "https://www.naukri.com/"
-            "jobs-in-india"
+            f"{self.BASE_URL}jobs-in-india"
             f"?k={quote(keyword)}"
         )
-
-        if location and location.strip():
-            search_url += (
-                f"&l={quote(location.strip())}"
-            )
+        if location:
+            search_url += f"&l={quote(location)}"
 
         self.page.goto(
             search_url,
             wait_until="domcontentloaded",
         )
-
         self.wait_for_page()
-        self._settle_page()
 
     def _click_search_button(self) -> bool:
         selectors = [
             'button:has-text("Search")',
-            'input[type="submit"]',
             'button[type="submit"]',
+            'input[type="submit"]',
         ]
         for selector in selectors:
             try:
@@ -139,11 +136,64 @@ class NaukriSite(BaseJobSite):
                 continue
         return False
 
-    def _settle_page(self) -> None:
+    def _fill_location(self, location: str) -> bool:
+        selectors = [
+            'input[placeholder*="Location"]',
+            'input[placeholder*="location"]',
+            'input[placeholder*="Enter location"]',
+            'input[name="location"]',
+            'input[name="locations"]',
+        ]
+
+        for selector in selectors:
+            try:
+                locator = self.page.locator(selector).first
+                if locator.is_visible(timeout=1000):
+                    locator.fill(location)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _wait_for_results(self) -> None:
+        """Give Naukri's client-side result list time to render."""
+        result_selectors = [
+            'a[href*="/job-listings-"]',
+            'a[href*="/job-listings/"]',
+            "article.jobTuple",
+            ".cust-job-tuple",
+            ".jobTuple",
+            "[data-job-id]",
+        ]
+
+        for selector in result_selectors:
+            try:
+                self.page.locator(selector).first.wait_for(
+                    state="attached",
+                    timeout=7000,
+                )
+                break
+            except Exception:
+                continue
+
+        # Lazy-loaded result cards are common. A small number of normal
+        # scrolls is enough to trigger them without attempting to defeat any
+        # anti-bot mechanism.
+        for _ in range(2):
+            try:
+                self.page.mouse.wheel(0, 900)
+                self.page.wait_for_timeout(700)
+            except Exception:
+                break
+
         try:
-            self.page.wait_for_timeout(1200)
+            self.page.wait_for_timeout(800)
         except Exception:
             pass
+
+    # ========================================================
+    # ACCESS STATE
+    # ========================================================
 
     def get_access_state(self) -> dict:
         try:
@@ -158,6 +208,7 @@ class NaukriSite(BaseJobSite):
             body = self.page.locator("body").inner_text(timeout=3000).lower()
         except Exception:
             body = ""
+
         text = f"{title} {url} {body}"
         verification_terms = (
             "captcha",
@@ -168,14 +219,22 @@ class NaukriSite(BaseJobSite):
             "just a moment",
             "additional verification",
         )
-        matched = next((term for term in verification_terms if term in text), None)
+        matched = next(
+            (term for term in verification_terms if term in text),
+            None,
+        )
+
         if matched:
             return {
                 "blocked": True,
                 "code": "verification_required",
-                "message": f"Naukri requires additional verification ({matched}).",
+                "message": (
+                    "Naukri requires additional verification "
+                    f"({matched})."
+                ),
                 "requires_human_action": True,
             }
+
         return {
             "blocked": False,
             "code": "ok",
@@ -183,195 +242,124 @@ class NaukriSite(BaseJobSite):
             "requires_human_action": False,
         }
 
-    def _fill_location(
-        self,
-        location: str,
-    ) -> bool:
-        """
-        Try to fill the public location field.
-        """
-
-        selectors = [
-            'input[placeholder*="Location"]',
-            'input[placeholder*="location"]',
-            'input[placeholder*="Enter location"]',
-            'input[placeholder*="location"]',
-            'input[name="location"]',
-            'input[name="locations"]',
-        ]
-
-        for selector in selectors:
-            try:
-                locator = (
-                    self.page.locator(
-                        selector
-                    ).first
-                )
-
-                if locator.is_visible(
-                    timeout=1000
-                ):
-                    locator.fill(
-                        location
-                    )
-
-                    return True
-
-            except Exception:
-                continue
-
-        return False
-
     # ========================================================
     # LISTINGS
     # ========================================================
 
     def get_job_listings(self) -> list[dict]:
         """
-        Extract visible Naukri job listings.
+        Extract visible public Naukri listings.
 
-        Returns normalized dictionaries containing:
-            title
-            company
-            location
-            url
-            description
+        Strategy order:
+            1. Known Naukri result-card selectors.
+            2. Current/legacy job-listing anchor selectors.
+            3. Generic anchors whose href clearly identifies a Naukri job.
+
+        The generic fallback is deliberately conservative: a URL must look
+        like a Naukri job-listing URL before it is accepted.
         """
-
         listings: list[dict] = []
+        seen: set[str] = set()
 
-        selectors = [
+        # Known/current result-card selectors.
+        card_selectors = [
             "article.jobTuple",
             "article.job-tuple",
+            ".jobTuple.bgWhite.br4.mb-8",
             ".jobTuple",
             ".cust-job-tuple",
             "[data-job-id]",
             "div[data-job-id]",
-            "div[class*=jobTuple]",
-            "div[class*=job-tuple]",
+            'article[class*="job"]',
+            'div[class*="jobTuple"]',
+            'div[class*="job-tuple"]',
         ]
 
-        cards = None
-
-        for selector in selectors:
+        for selector in card_selectors:
             try:
-                locator = self.page.locator(
-                    selector
-                )
+                cards = self.page.locator(selector)
+                count = cards.count()
+                if count <= 0:
+                    continue
 
-                if locator.count() > 0:
-                    cards = locator
-                    break
+                for index in range(count):
+                    try:
+                        card = cards.nth(index)
+                        job = self._extract_card(card)
+                        self._append_listing(listings, seen, job)
+                    except Exception:
+                        continue
 
+                if listings:
+                    return listings
             except Exception:
                 continue
 
-        if cards is not None:
-            count = cards.count()
+        # Generic public job links. This is the important fallback for the
+        # current Naukri layout shown by the user.
+        link_selectors = [
+            'a[href*="/job-listings-"]',
+            'a[href*="/job-listings/"]',
+            'a[href*="naukri.com/job-listings-"]',
+            'a[href*="naukri.com/job-listings/"]',
+        ]
 
-            for index in range(count):
-                try:
-                    card = cards.nth(index)
-
-                    if not card.is_visible(
-                        timeout=1000
-                    ):
-                        continue
-
-                    job = self._extract_card(
-                        card
-                    )
-
-                    if not job["title"]:
-                        continue
-
-                    if not job["url"]:
-                        continue
-
-                    if any(
-                        item["url"] == job["url"]
-                        for item in listings
-                    ):
-                        continue
-
-                    listings.append(job)
-
-                except Exception:
-                    continue
-
-            return listings
-
-        # Generic fallback for publicly visible job links.
-        links = self.page.locator(
-            'a[href*="/job-listings-"], a[href*="/job-listings/"]'
-        )
-
-        for index in range(
-            links.count()
-        ):
+        for selector in link_selectors:
             try:
-                link = links.nth(index)
-
-                if not link.is_visible(
-                    timeout=1000
-                ):
-                    continue
-
-                title = (link.inner_text() or "").strip()
-                if not title:
-                    title = (link.get_attribute("aria-label") or link.get_attribute("title") or "").strip()
-
-                href = (
-                    link.get_attribute(
-                        "href"
-                    )
-                    or ""
-                )
-
-                url = self._absolute_url(
-                    href
-                )
-
-                if not title or not url:
-                    continue
-
-                if any(
-                    item["url"] == url
-                    for item in listings
-                ):
-                    continue
-
-                listings.append(
-                    {
-                        "title": title,
-                        "company": "",
-                        "location": "",
-                        "url": url,
-                        "description": "",
-                    }
-                )
-
+                links = self.page.locator(selector)
+                count = links.count()
+                for index in range(count):
+                    try:
+                        link = links.nth(index)
+                        job = self._extract_from_job_link(link)
+                        self._append_listing(listings, seen, job)
+                    except Exception:
+                        continue
+                if listings:
+                    return listings
             except Exception:
                 continue
 
         return listings
 
-    def _extract_card(
+    def _append_listing(
         self,
-        card,
-    ) -> dict:
-        """
-        Extract one Naukri job card.
-        """
+        listings: list[dict],
+        seen: set[str],
+        job: dict,
+    ) -> None:
+        title = str(job.get("title", "") or "").strip()
+        url = str(job.get("url", "") or "").strip()
+        if not title or not url:
+            return
 
+        key = self._canonical_url(url)
+        if key in seen:
+            return
+
+        # Avoid accepting obvious navigation links.
+        if not self._looks_like_job_url(url):
+            return
+
+        job = {
+            "title": title,
+            "company": str(job.get("company", "") or "").strip(),
+            "location": str(job.get("location", "") or "").strip(),
+            "url": url,
+            "description": str(job.get("description", "") or "").strip(),
+        }
+        seen.add(key)
+        listings.append(job)
+
+    def _extract_card(self, card) -> dict:
         title = self._first_text_from(
             card,
             [
+                "a.title",
                 ".title",
                 ".jobTitle",
-                "[class*=jobTitle]",
-                ".jobTitle",
-                "a.title",
+                '[class*="jobTitle"]',
+                'a[class*="title"]',
                 "h2",
                 "h3",
             ],
@@ -380,10 +368,12 @@ class NaukriSite(BaseJobSite):
         company = self._first_text_from(
             card,
             [
+                "a.subTitle",
                 ".comp-name",
                 ".companyInfo",
                 ".company-name",
                 ".subTitle",
+                '[class*="comp-name"]',
             ],
         )
 
@@ -394,6 +384,7 @@ class NaukriSite(BaseJobSite):
                 ".location",
                 ".job-location",
                 ".locationsContainer",
+                '[class*="location"]',
             ],
         )
 
@@ -403,37 +394,130 @@ class NaukriSite(BaseJobSite):
                 ".job-desc",
                 ".job-description",
                 ".jobDescription",
+                '[class*="job-desc"]',
             ],
         )
 
         url = ""
-
         for selector in [
             "a.title",
             'a[href*="/job-listings-"]',
+            'a[href*="/job-listings/"]',
             "a[href]",
         ]:
             try:
-                link = card.locator(
-                    selector
-                ).first
-
+                link = card.locator(selector).first
                 if link.count() == 0:
                     continue
-
-                href = (
-                    link.get_attribute(
-                        "href"
-                    )
-                    or ""
-                )
-
-                if href:
-                    url = self._absolute_url(
-                        href
-                    )
+                href = link.get_attribute("href") or ""
+                if self._looks_like_job_url(href):
+                    url = self._absolute_url(href)
                     break
+            except Exception:
+                continue
 
+        # If class-specific selectors fail, use the card's visible text and
+        # the first public job link. This keeps extraction resilient to class
+        # renames.
+        if not title or not url:
+            try:
+                link = card.locator('a[href*="/job-listings-"]').first
+                if link.count() > 0:
+                    href = link.get_attribute("href") or ""
+                    if not url and self._looks_like_job_url(href):
+                        url = self._absolute_url(href)
+                    if not title:
+                        title = self._link_text(link)
+            except Exception:
+                pass
+
+        if not title:
+            try:
+                link = card.locator('a[href*="/job-listings/"]').first
+                if link.count() > 0:
+                    href = link.get_attribute("href") or ""
+                    if not url and self._looks_like_job_url(href):
+                        url = self._absolute_url(href)
+                    title = self._link_text(link)
+            except Exception:
+                pass
+
+        return {
+            "title": title,
+            "company": company,
+            "location": location,
+            "url": url,
+            "description": description,
+        }
+
+    def _extract_from_job_link(self, link) -> dict:
+        href = link.get_attribute("href") or ""
+        url = self._absolute_url(href)
+        title = self._link_text(link)
+
+        # Walk up a few ancestors. We do not assume one particular Naukri
+        # class because the current site changes card markup frequently.
+        company = ""
+        location = ""
+        description = ""
+
+        for level in range(1, 7):
+            try:
+                ancestor = link.locator(
+                    f"xpath=ancestor::*[{level}]"
+                ).first
+                if ancestor.count() == 0:
+                    continue
+
+                text = self._safe_inner_text(ancestor)
+                if len(text) < 20:
+                    continue
+
+                if not company:
+                    company = self._first_text_from(
+                        ancestor,
+                        [
+                            "a.subTitle",
+                            ".comp-name",
+                            ".companyInfo",
+                            ".company-name",
+                            ".subTitle",
+                            '[class*="comp-name"]',
+                        ],
+                    )
+
+                if not location:
+                    location = self._first_text_from(
+                        ancestor,
+                        [
+                            ".loc",
+                            ".location",
+                            ".job-location",
+                            ".locationsContainer",
+                            '[class*="location"]',
+                        ],
+                    )
+
+                if not description:
+                    description = self._first_text_from(
+                        ancestor,
+                        [
+                            ".job-desc",
+                            ".job-description",
+                            ".jobDescription",
+                            '[class*="job-desc"]',
+                        ],
+                    )
+
+                # A card-like ancestor usually has enough content to serve
+                # as a fallback description even if no description class is
+                # available.
+                if not description and len(text) > 100:
+                    description = text
+
+                # Stop once we have useful metadata.
+                if company or location or description:
+                    break
             except Exception:
                 continue
 
@@ -449,24 +533,14 @@ class NaukriSite(BaseJobSite):
     # DETAILS
     # ========================================================
 
-    def get_job_details(
-        self,
-        job_url: str,
-    ) -> dict:
-        """
-        Open and extract details from a public Naukri job page.
-        """
-
+    def get_job_details(self, job_url: str) -> dict:
         if not job_url or not job_url.strip():
-            raise ValueError(
-                "job_url cannot be empty."
-            )
+            raise ValueError("job_url cannot be empty.")
 
         self.page.goto(
             job_url.strip(),
             wait_until="domcontentloaded",
         )
-
         self.wait_for_page()
 
         title = self._first_text(
@@ -474,10 +548,9 @@ class NaukriSite(BaseJobSite):
                 "h1",
                 ".jd-header-title",
                 ".jd-header h1",
-                ".styles_jd-header-title__",
+                '[class*="jd-header-title"]',
             ]
         )
-
         company = self._first_text(
             [
                 ".jd-header-comp-name",
@@ -485,20 +558,20 @@ class NaukriSite(BaseJobSite):
                 ".company-name",
             ]
         )
-
         location = self._first_text(
             [
                 ".loc",
                 ".location",
                 ".jd-job-meta",
+                '[class*="location"]',
             ]
         )
-
         description = self._first_text(
             [
                 ".job-desc",
                 ".dang-inner-html",
                 ".job-description",
+                '[class*="job-desc"]',
                 "main",
             ]
         )
@@ -515,86 +588,79 @@ class NaukriSite(BaseJobSite):
     # HELPERS
     # ========================================================
 
-    def _first_text(
-        self,
-        selectors: list[str],
-    ) -> str:
+    def _first_text(self, selectors: list[str]) -> str:
         for selector in selectors:
             try:
-                locator = (
-                    self.page.locator(
-                        selector
-                    ).first
-                )
-
-                if locator.is_visible(
-                    timeout=1000
-                ):
-                    text = (
-                        locator.inner_text()
-                        .strip()
-                    )
-
+                locator = self.page.locator(selector).first
+                if locator.is_visible(timeout=1000):
+                    text = self._safe_inner_text(locator)
                     if text:
                         return text
-
             except Exception:
                 continue
-
         return ""
 
-    def _first_text_from(
-        self,
-        parent,
-        selectors: list[str],
-    ) -> str:
+    def _first_text_from(self, parent, selectors: list[str]) -> str:
         for selector in selectors:
             try:
-                locator = (
-                    parent.locator(
-                        selector
-                    ).first
-                )
-
+                locator = parent.locator(selector).first
                 if locator.count() == 0:
                     continue
-
-                text = (
-                    locator.inner_text()
-                    .strip()
-                )
-
+                text = self._safe_inner_text(locator)
                 if text:
                     return text
-
             except Exception:
                 continue
-
         return ""
 
-    def _absolute_url(
-        self,
-        href: str,
-    ) -> str:
-        if not href:
+    @staticmethod
+    def _safe_inner_text(locator) -> str:
+        try:
+            return " ".join(
+                (locator.inner_text() or "").split()
+            ).strip()
+        except Exception:
             return ""
 
-        href = href.strip()
+    @staticmethod
+    def _link_text(link) -> str:
+        try:
+            text = " ".join(
+                (link.inner_text() or "").split()
+            ).strip()
+        except Exception:
+            text = ""
 
-        if href.startswith(
-            "http://"
-        ) or href.startswith(
-            "https://"
-        ):
-            return href
+        if text:
+            return text
 
-        if href.startswith("/"):
-            return (
-                "https://www.naukri.com"
-                f"{href}"
-            )
-
+        for attribute in ("aria-label", "title"):
+            try:
+                value = (link.get_attribute(attribute) or "").strip()
+                if value:
+                    return value
+            except Exception:
+                continue
         return ""
+
+    @classmethod
+    def _looks_like_job_url(cls, href: str) -> bool:
+        if not href:
+            return False
+        value = href.strip().lower()
+        return (
+            "/job-listings-" in value
+            or "/job-listings/" in value
+        )
+
+    def _absolute_url(self, href: str) -> str:
+        if not href:
+            return ""
+        return urljoin(self.BASE_URL, href.strip())
+
+    @staticmethod
+    def _canonical_url(url: str) -> str:
+        return url.rstrip("/").split("#", 1)[0].lower()
 
     def wait_for_page(self) -> None:
         try:

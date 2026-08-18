@@ -612,6 +612,7 @@ class JobAgentService:
         resume_output_path: Optional[str] = None,
         confirm: bool = False,
         dry_run: bool = False,
+        also_outreach: bool = False,
         **provider_options: Any,
     ) -> ExecutionResult:
         """
@@ -666,6 +667,25 @@ class JobAgentService:
                     resolved_contacts = []
 
         # ----------------------------------------------------
+        # Optional outreach after application
+        # ----------------------------------------------------
+
+        if (
+            decision_name == "apply"
+            and also_outreach
+            and contacts is None
+        ):
+            job = ranked_result.get("job")
+            if isinstance(job, Mapping):
+                try:
+                    resolved_contacts = self.discover_contacts(
+                        dict(job),
+                        **provider_options,
+                    )
+                except Exception:
+                    resolved_contacts = []
+
+        # ----------------------------------------------------
         # Resume path
         # ----------------------------------------------------
 
@@ -675,7 +695,10 @@ class JobAgentService:
 
         if (
             resolved_resume_path is None
-            and decision_name == "outreach"
+            and (
+                decision_name == "outreach"
+                or also_outreach
+            )
         ):
             try:
                 resolved_resume_path = (
@@ -698,11 +721,13 @@ class JobAgentService:
             fields=fields or {},
             contacts=resolved_contacts,
             resume=resume,
+            resume_path=resolved_resume_path,
             resume_output_path=(
                 resume_output_path
             ),
             confirm=confirm,
             dry_run=dry_run,
+            also_outreach=also_outreach,
         )
 
     # ========================================================
@@ -729,6 +754,7 @@ class JobAgentService:
         resume_output_path: Optional[str] = None,
         confirm: bool = False,
         dry_run: bool = False,
+        also_outreach: bool = False,
         **provider_options: Any,
     ) -> ExecutionResult:
         """
@@ -857,6 +883,7 @@ class JobAgentService:
             ),
             confirm=confirm,
             dry_run=dry_run,
+            also_outreach=also_outreach,
             **provider_options,
         )
 
@@ -892,6 +919,7 @@ class JobAgentService:
         ] = None,
         confirm: bool = False,
         dry_run: bool = False,
+        also_outreach: bool = False,
         **provider_options: Any,
     ) -> list[ExecutionResult]:
         """
@@ -1046,11 +1074,13 @@ class JobAgentService:
                     ranked_result
                 )
 
-                decision_name = getattr(
-                    decision,
-                    "decision",
-                    "",
-                )
+                decision_name = str(
+                    getattr(
+                        decision,
+                        "decision",
+                        "",
+                    )
+                ).strip().lower()
 
                 # ------------------------------------------------
                 # Browser page
@@ -1113,6 +1143,7 @@ class JobAgentService:
                         ),
                         confirm=confirm,
                         dry_run=dry_run,
+                        also_outreach=also_outreach,
                         **provider_options,
                     )
                 )
@@ -1187,6 +1218,7 @@ class JobAgentService:
         ] = None,
         confirm: bool = False,
         dry_run: bool = True,
+        also_outreach: bool = False,
         **source_options: Any,
     ) -> JobAgentRunResult:
         """
@@ -1274,6 +1306,7 @@ class JobAgentService:
                 ),
                 confirm=confirm,
                 dry_run=dry_run,
+                also_outreach=also_outreach,
                 **source_options,
             )
         )
@@ -1324,7 +1357,9 @@ class JobAgentService:
 
         for execution in executions:
 
-            decision = execution.decision
+            decision = str(
+                execution.decision or ""
+            ).strip().lower()
 
             if decision == "apply":
                 apply_count += 1

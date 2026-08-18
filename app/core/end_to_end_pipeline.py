@@ -690,6 +690,7 @@ class EndToEndPipeline:
         *,
         page: Any,
         fields: Optional[dict] = None,
+        resume: Optional[dict] = None,
         resume_output_path: Optional[str] = None,
     ) -> dict:
         """
@@ -758,7 +759,9 @@ class EndToEndPipeline:
 
         # Resolve the exact resume chosen by matching.
         selected_resume = (
-            self._resolve_selected_resume_data(
+            dict(resume)
+            if isinstance(resume, dict)
+            else self._resolve_selected_resume_data(
                 ranked_result
             )
         )

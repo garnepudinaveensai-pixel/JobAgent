@@ -165,9 +165,11 @@ class ApplicationExecutionRouter:
             Iterable[dict]
         ] = None,
         resume: Optional[dict] = None,
+        resume_path: Optional[str] = None,
         resume_output_path: Optional[str] = None,
         confirm: bool = False,
         dry_run: bool = False,
+        also_outreach: bool = False,
     ) -> ExecutionResult:
         """
         Decide and route one ranked job.
@@ -227,12 +229,15 @@ class ApplicationExecutionRouter:
                 ranking_score=ranking_score,
                 page=page,
                 fields=fields or {},
+                contacts=contacts or [],
                 resume=resume,
+                resume_path=resume_path,
                 resume_output_path=(
                     resume_output_path
                 ),
                 confirm=confirm,
                 dry_run=dry_run,
+                also_outreach=also_outreach,
             )
 
         if decision_value == OUTREACH:
@@ -243,6 +248,7 @@ class ApplicationExecutionRouter:
                 ranking_score=ranking_score,
                 contacts=contacts or [],
                 resume=resume,
+                resume_path=resume_path,
                 confirm=confirm,
                 dry_run=dry_run,
             )
@@ -308,10 +314,13 @@ class ApplicationExecutionRouter:
         ranking_score: float,
         page: Any,
         fields: dict[str, Any],
+        contacts: Iterable[dict],
         resume: Optional[dict],
+        resume_path: Optional[str],
         resume_output_path: Optional[str],
         confirm: bool,
         dry_run: bool,
+        also_outreach: bool = False,
     ) -> ExecutionResult:
 
         if self.application_pipeline is None:
@@ -455,6 +464,33 @@ class ApplicationExecutionRouter:
         # ----------------------------------------------------
 
         if dry_run:
+            metadata = {
+                "dry_run": True,
+            }
+
+            if also_outreach:
+                try:
+                    outreach_prepared = self._prepare_outreach(
+                        contacts=contacts or [],
+                        job=job,
+                        resume=resume,
+                        resume_path=resume_path,
+                    )
+                    metadata["outreach_prepared"] = (
+                        dict(outreach_prepared)
+                        if isinstance(outreach_prepared, Mapping)
+                        else outreach_prepared
+                    )
+                    metadata["outreach_status"] = (
+                        "dry_run_ready"
+                        if isinstance(outreach_prepared, Mapping)
+                        and outreach_prepared.get("success", False)
+                        else "outreach_prepare_failed"
+                    )
+                except Exception as exc:
+                    metadata["outreach_status"] = "outreach_failed"
+                    metadata["outreach_error"] = str(exc)
+
             return ExecutionResult(
                 success=True,
                 decision=APPLY,
@@ -470,9 +506,7 @@ class ApplicationExecutionRouter:
                 submitted=False,
                 confirmation_required=False,
                 result=dict(prepared),
-                metadata={
-                    "dry_run": True,
-                },
+                metadata=metadata,
             )
 
         # ----------------------------------------------------
@@ -577,6 +611,90 @@ class ApplicationExecutionRouter:
             )
         )
 
+        submitted_flag = bool(
+            submitted.get(
+                "submitted",
+                success,
+            )
+        )
+
+        metadata = {
+            "application_result": dict(submitted),
+        }
+
+        if success and also_outreach:
+            try:
+                outreach_prepared = self._prepare_outreach(
+                    contacts=contacts or [],
+                    job=job,
+                    resume=resume,
+                    resume_path=(
+                        str(
+                            prepared.get("resume_pdf")
+                            or resume_path
+                            or ""
+                        ).strip()
+                        or None
+                    ),
+                )
+                metadata["outreach_prepared"] = (
+                    dict(outreach_prepared)
+                    if isinstance(outreach_prepared, Mapping)
+                    else outreach_prepared
+                )
+
+                if (
+                    isinstance(outreach_prepared, Mapping)
+                    and outreach_prepared.get("success", False)
+                ):
+                    if dry_run:
+                        metadata["outreach_status"] = "dry_run_ready"
+                    elif not confirm:
+                        metadata["outreach_status"] = "confirmation_required"
+                    else:
+                        sent = self._send_outreach(
+                            contacts=contacts or [],
+                            job=job,
+                            resume=resume,
+                            resume_path=(
+                                str(
+                                    prepared.get("resume_pdf")
+                                    or resume_path
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                            confirm=True,
+                        )
+                        metadata["outreach_result"] = (
+                            dict(sent)
+                            if isinstance(sent, Mapping)
+                            else sent
+                        )
+                        if isinstance(sent, Mapping):
+                            metadata["outreach_status"] = str(
+                                sent.get(
+                                    "status",
+                                    "sent"
+                                    if sent.get("success", False)
+                                    else "outreach_send_failed",
+                                )
+                            )
+                            metadata["outreach_sent"] = bool(
+                                sent.get(
+                                    "sent",
+                                    sent.get("success", False),
+                                )
+                            )
+                        else:
+                            metadata["outreach_status"] = "outreach_send_failed"
+                            metadata["outreach_sent"] = False
+                else:
+                    metadata["outreach_status"] = "outreach_prepare_failed"
+            except Exception as exc:
+                metadata["outreach_status"] = "outreach_failed"
+                metadata["outreach_error"] = str(exc)
+
         return ExecutionResult(
             success=success,
             decision=APPLY,
@@ -590,24 +708,17 @@ class ApplicationExecutionRouter:
             ranking_score=ranking_score,
             prepared=True,
             executed=success,
-            submitted=bool(
-                submitted.get(
-                    "submitted",
-                    success,
-                )
-            ),
+            submitted=submitted_flag,
+            sent=bool(metadata.get("outreach_sent", False)),
             confirmation_required=False,
             result=dict(submitted),
             error=(
-                str(
-                    submitted.get("error")
-                )
+                str(submitted.get("error"))
                 if submitted.get("error")
                 else None
             ),
-            requires_human_action=(
-                requires_human_action
-            ),
+            metadata=metadata,
+            requires_human_action=requires_human_action,
         )
 
     # ========================================================
@@ -623,6 +734,7 @@ class ApplicationExecutionRouter:
         ranking_score: float,
         contacts: Iterable[dict],
         resume: Optional[dict],
+        resume_path: Optional[str],
         confirm: bool,
         dry_run: bool,
     ) -> ExecutionResult:
@@ -648,6 +760,7 @@ class ApplicationExecutionRouter:
                     contacts=contacts,
                     job=job,
                     resume=resume,
+                    resume_path=resume_path,
                 )
             )
 
@@ -758,6 +871,7 @@ class ApplicationExecutionRouter:
                 contacts=contacts,
                 job=job,
                 resume=resume,
+                resume_path=resume_path,
                 confirm=True,
             )
 
@@ -1043,6 +1157,7 @@ class ApplicationExecutionRouter:
         contacts: Iterable[dict],
         job: dict[str, Any],
         resume: Optional[dict],
+        resume_path: Optional[str] = None,
     ) -> Any:
 
         pipeline = self.outreach_pipeline
@@ -1055,6 +1170,7 @@ class ApplicationExecutionRouter:
                 contacts=contacts,
                 job=job,
                 resume=resume,
+                resume_path=resume_path,
             )
 
         if hasattr(
@@ -1079,6 +1195,7 @@ class ApplicationExecutionRouter:
         contacts: Iterable[dict],
         job: dict[str, Any],
         resume: Optional[dict],
+        resume_path: Optional[str] = None,
         confirm: bool,
     ) -> Any:
 
@@ -1092,6 +1209,7 @@ class ApplicationExecutionRouter:
                 contacts=contacts,
                 job=job,
                 resume=resume,
+                resume_path=resume_path,
                 confirm=confirm,
             )
 

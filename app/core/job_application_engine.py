@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Iterable, Optional
+import inspect
 
 
 class JobApplicationEngine:
@@ -504,6 +505,7 @@ class JobApplicationEngine:
         self,
         ranked_result: dict,
         *,
+        page: Any = None,
         resume: Optional[dict] = None,
         resume_output_path: str,
         fields: Optional[dict] = None,
@@ -516,11 +518,17 @@ class JobApplicationEngine:
         Expected ApplicationWorkflow API:
 
             prepare_application(
+                page=page,
                 job=job,
                 resume=resume,
                 fields=fields,
                 resume_output_path=path,
             )
+
+        ``page`` is optional at this engine boundary for backwards
+        compatibility with non-browser workflow doubles.  When a
+        browser-aware workflow accepts ``page`` and a page is supplied,
+        the page is forwarded to it.
 
         The workflow itself performs:
 
@@ -620,11 +628,40 @@ class JobApplicationEngine:
                 "prepare_application()."
             )
 
+        # The browser-aware ApplicationWorkflow requires a Playwright
+        # page, while older injected test doubles and lightweight
+        # workflows may not accept one.  Build the call from the actual
+        # callable signature instead of catching TypeError from inside
+        # the workflow (which could hide a real application bug).
+        prepare_kwargs = {
+            "job": job,
+            "resume": resume,
+            "fields": fields,
+            "resume_output_path": resume_output_path,
+        }
+
+        if page is not None:
+            try:
+                parameters = inspect.signature(
+                    prepare
+                ).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+
+            accepts_page = (
+                "page" in parameters
+                or any(
+                    parameter.kind
+                    == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+            )
+
+            if accepts_page:
+                prepare_kwargs["page"] = page
+
         result = prepare(
-            job=job,
-            resume=resume,
-            fields=fields,
-            resume_output_path=resume_output_path,
+            **prepare_kwargs
         )
 
         if result is None:
