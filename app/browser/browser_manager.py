@@ -65,6 +65,14 @@ class BrowserManager:
         if self._context is not None:
             return self
 
+        # For an ephemeral browser, ``start()`` creates the browser first
+        # and the context is created lazily by ``create_context()``.  Treat
+        # an already-running Playwright/browser pair as started as well;
+        # otherwise a second ``start()`` would incorrectly create a second
+        # sync Playwright instance (and can fail when an event loop is active).
+        if self._playwright is not None and self._browser is not None:
+            return self
+
         try:
             self._playwright = sync_playwright().start()
 
@@ -201,7 +209,11 @@ class BrowserManager:
 
         self._validate_url(url)
 
-        if self._context is None:
+        if (
+            self._context is None
+            and self._playwright is None
+            and self._browser is None
+        ):
             self.start()
 
         page = self.new_page()

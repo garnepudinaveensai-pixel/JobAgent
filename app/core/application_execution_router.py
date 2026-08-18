@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional
+import inspect
 
 from app.core.application_decision_engine import (
     APPLY,
@@ -1166,12 +1167,18 @@ class ApplicationExecutionRouter:
             pipeline,
             "prepare_outreach",
         ):
-            return pipeline.prepare_outreach(
-                contacts=contacts,
-                job=job,
-                resume=resume,
-                resume_path=resume_path,
+            method = pipeline.prepare_outreach
+            kwargs = self._compatible_kwargs(
+                method,
+                {
+                    "contacts": contacts,
+                    "job": job,
+                    "resume": resume,
+                    "candidate": resume,
+                    "resume_path": resume_path,
+                },
             )
+            return method(**kwargs)
 
         if hasattr(
             pipeline,
@@ -1205,13 +1212,19 @@ class ApplicationExecutionRouter:
             pipeline,
             "send_outreach",
         ):
-            return pipeline.send_outreach(
-                contacts=contacts,
-                job=job,
-                resume=resume,
-                resume_path=resume_path,
-                confirm=confirm,
+            method = pipeline.send_outreach
+            kwargs = self._compatible_kwargs(
+                method,
+                {
+                    "contacts": contacts,
+                    "job": job,
+                    "resume": resume,
+                    "candidate": resume,
+                    "resume_path": resume_path,
+                    "confirm": confirm,
+                },
             )
+            return method(**kwargs)
 
         if hasattr(
             pipeline,
@@ -1229,6 +1242,38 @@ class ApplicationExecutionRouter:
             "Expected send_outreach() "
             "or send()."
         )
+
+    @staticmethod
+    def _compatible_kwargs(
+        method: Any,
+        candidates: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Pass only keyword arguments supported by an injected adapter.
+
+        The router is used with both the production outreach pipeline and
+        small test/integration doubles.  Those adapters historically used
+        either ``resume`` or ``candidate`` and may not accept the newer
+        ``resume_path`` argument.  Inspecting the callable signature keeps
+        this compatibility explicit without catching TypeError raised by
+        the adapter's own implementation.
+        """
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            return dict(candidates)
+
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            return dict(candidates)
+
+        return {
+            name: value
+            for name, value in candidates.items()
+            if name in parameters
+        }
 
     # ========================================================
     # EXTRACTION
