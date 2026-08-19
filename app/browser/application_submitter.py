@@ -876,6 +876,209 @@ class ApplicationSubmitter:
             self._page_status = self.STATUS_SUBMITTED
         return result
 
+    def _continue_application_flow(
+        self,
+        *,
+        confirm: bool,
+        before_url: str = "",
+        max_steps: int = 8,
+    ) -> dict:
+        """
+        Continue an application as a closed-loop state machine.
+
+        Each iteration observes the current page before choosing the next
+        action.  It never bypasses login/CAPTCHA and never claims success
+        merely because a button was clicked.
+        """
+
+        if not confirm:
+            return {
+                "success": False,
+                "status": self.STATUS_CONFIRMATION_REQUIRED,
+                "submitted": False,
+                "page_analysis": self.analyze_page(),
+            }
+
+        history = []
+        last_url = before_url or self._safe_page_url()
+
+        for step in range(max(1, int(max_steps))):
+            analysis = self.analyze_page()
+            history.append({
+                "step": step + 1,
+                "status": analysis.get("status"),
+                "url": analysis.get("url"),
+                "title": analysis.get("title"),
+            })
+
+            status = analysis.get("status")
+
+            if status == self.STATUS_SUBMITTED or self._success_visible():
+                self._application_completed = True
+                self._page_status = self.STATUS_SUBMITTED
+                return {
+                    "success": True,
+                    "status": self.STATUS_SUBMITTED,
+                    "submitted": True,
+                    "history": history,
+                    "page_analysis": analysis,
+                }
+
+            if status in {self.STATUS_LOGIN_REQUIRED, self.STATUS_CAPTCHA_DETECTED}:
+                return {
+                    "success": False,
+                    "status": status,
+                    "submitted": False,
+                    "requires_human_action": True,
+                    "message": analysis.get("reason", "Human action required."),
+                    "history": history,
+                    "page_analysis": analysis,
+                }
+
+            if status == self.STATUS_JOB_UNAVAILABLE:
+                return {
+                    "success": False,
+                    "status": status,
+                    "submitted": False,
+                    "history": history,
+                    "page_analysis": analysis,
+                }
+
+            if status == self.STATUS_FORM_DETECTED:
+                prepared = self.prepare_application(
+                    resume_path=self._prepared_resume_path,
+                    fields=self._prepared_fields,
+                )
+                if not prepared.get("success"):
+                    prepared["history"] = history
+                    return prepared
+                # Preparation may itself have refreshed the page.  Loop back
+                # through analysis so required fields and the final control
+                # are evaluated again before submission.
+                validation = prepared.get("validation", {})
+                if not validation.get("ready", False):
+                    prepared["history"] = history
+                    return prepared
+                status = self.STATUS_READY
+
+            if status == self.STATUS_READY:
+                form = self._ensure_form()
+                submit_button = self._find_submission_control(form)
+                if submit_button is None:
+                    return {
+                        "success": False,
+                        "status": "submit_button_not_found",
+                        "submitted": False,
+                        "history": history,
+                        "page_analysis": self.get_page_analysis(),
+                    }
+
+                try:
+                    submit_button.scroll_into_view_if_needed(timeout=self.timeout)
+                    submit_button.click(timeout=self.timeout)
+                    try:
+                        self.page.wait_for_load_state("domcontentloaded", timeout=self.timeout)
+                    except Exception:
+                        pass
+                    try:
+                        self.page.wait_for_timeout(1000)
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    return {
+                        "success": False,
+                        "status": self.STATUS_SUBMISSION_FAILED,
+                        "message": str(exc),
+                        "history": history,
+                        "page_analysis": self.get_page_analysis(),
+                    }
+                continue
+
+            if status == self.STATUS_APPLY_CONTROL_FOUND:
+                control = self._find_apply_control()
+                if control is None:
+                    return {
+                        "success": False,
+                        "status": self.STATUS_APPLICATION_ROUTE_NOT_FOUND,
+                        "history": history,
+                        "page_analysis": analysis,
+                    }
+
+                current_url = self._safe_page_url()
+                try:
+                    control.scroll_into_view_if_needed(timeout=self.timeout)
+                    control.click(timeout=self.timeout)
+                    try:
+                        self.page.wait_for_load_state("domcontentloaded", timeout=self.timeout)
+                    except Exception:
+                        pass
+                    try:
+                        self.page.wait_for_timeout(1000)
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    return {
+                        "success": False,
+                        "status": self.STATUS_SUBMISSION_FAILED,
+                        "message": str(exc),
+                        "history": history,
+                        "page_analysis": analysis,
+                    }
+
+                new_url = self._safe_page_url()
+                # A real route transition gets another observation cycle.
+                # For same-page test controls (e.g. href="#"), avoid endlessly
+                # clicking the same element and return a truthful handoff.
+                if new_url == current_url and not self._form_exists() and not self._success_visible():
+                    return {
+                        "success": True,
+                        "status": self.STATUS_APPLICATION_HANDOFF,
+                        "submitted": False,
+                        "message": "Apply control was activated but no next application state appeared.",
+                        "history": history,
+                        "page_analysis": self.analyze_page(),
+                    }
+                last_url = new_url
+                continue
+
+            # Unknown job-board/company page: let the adaptive navigator find
+            # Careers, Jobs, another Apply control, or the application form.
+            navigator = ApplicationNavigator(self.page, timeout=self.timeout, max_hops=3)
+            navigation = navigator.navigate(self._job_context)
+            history.append({
+                "step": step + 1,
+                "action": "navigate",
+                "navigation": navigation,
+                "url": self._safe_page_url(),
+            })
+
+            nav_status = navigation.get("status")
+            if nav_status in {"form_detected", "submitted", "ready_to_apply"}:
+                continue
+
+            if self._safe_page_url() != last_url:
+                last_url = self._safe_page_url()
+                continue
+
+            return {
+                "success": False,
+                "status": self.STATUS_APPLICATION_ROUTE_NOT_FOUND,
+                "submitted": False,
+                "message": "No actionable application state was found after adaptive navigation.",
+                "history": history,
+                "page_analysis": self.analyze_page(),
+                "navigation": navigation,
+            }
+
+        return {
+            "success": False,
+            "status": self.STATUS_NAVIGATION_FAILED,
+            "submitted": False,
+            "message": f"Application flow reached the maximum of {max_steps} adaptive steps without confirmed submission.",
+            "history": history,
+            "page_analysis": self.analyze_page(),
+        }
+
     # ========================================================
     # FORM
     # ========================================================
@@ -1848,80 +2051,17 @@ class ApplicationSubmitter:
                     "page_analysis": analysis,
                 }
 
-            # Re-analyze after every transition.  A real application may
-            # expose another Apply step, an application form, a login/CAPTCHA
-            # barrier, or a confirmation page.
-            next_analysis = self.analyze_page()
-
-            if next_analysis["status"] == self.STATUS_FORM_DETECTED:
-                prepared = self.prepare_application(
-                    resume_path=self._prepared_resume_path,
-                    fields=self._prepared_fields,
-                )
-                if prepared.get("success"):
-                    return self.submit(confirm=True)
-                return prepared
-
-            if self._success_visible():
-                self._application_completed = True
-                self._page_status = self.STATUS_SUBMITTED
-                return {
-                    "success": True,
-                    "status": self.STATUS_SUBMITTED,
-                    "submitted": True,
-                    "page_analysis": next_analysis,
-                }
-
-            if next_analysis["status"] == self.STATUS_APPLY_CONTROL_FOUND:
-                return {
-                    "success": True,
-                    "status": self.STATUS_APPLICATION_HANDOFF,
-                    "submitted": False,
-                    "message": (
-                        "The Apply control was activated, but the resulting "
-                        "page still requires another application step. "
-                        "Submission was not claimed."
-                    ),
-                    "page_analysis": next_analysis,
-                }
-
-            if next_analysis["status"] in {
-                self.STATUS_LOGIN_REQUIRED,
-                self.STATUS_CAPTCHA_DETECTED,
-            }:
-                return {
-                    "success": False,
-                    "status": next_analysis["status"],
-                    "submitted": False,
-                    "requires_human_action": True,
-                    "message": next_analysis["reason"],
-                    "page_analysis": next_analysis,
-                }
-
-            # If the URL changed but the new page is not yet classifiable,
-            # report a handoff rather than falsely claiming failure or
-            # submission.  This is particularly useful for employer ATS
-            # redirects that finish rendering asynchronously.
-            if self._safe_page_url() != before_url:
-                return {
-                    "success": True,
-                    "status": self.STATUS_APPLICATION_HANDOFF,
-                    "submitted": False,
-                    "message": (
-                        "The application route advanced to a new page, "
-                        "but submission has not yet been confirmed."
-                    ),
-                    "page_analysis": next_analysis,
-                }
-
-            return {
-                "success": False,
-                "status": next_analysis.get(
-                    "status",
-                    self.STATUS_APPLICATION_ROUTE_NOT_FOUND,
-                ),
-                "page_analysis": next_analysis,
-            }
+            # Closed-loop application execution.  A click is only an action;
+            # after every action we inspect the new page and decide what to do
+            # next.  This is what allows a job-board "Apply on company site"
+            # route to continue through the employer careers page, another
+            # Apply button, the actual form, and finally the submit control.
+            result = self._continue_application_flow(
+                confirm=True,
+                before_url=before_url,
+                max_steps=8,
+            )
+            return result
 
         if analysis["status"] == self.STATUS_FORM_NOT_FOUND:
             return {

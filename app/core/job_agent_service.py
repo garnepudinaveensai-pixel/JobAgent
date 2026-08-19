@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -72,7 +72,91 @@ class JobAgentRunResult:
     human_action_required_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """
+        Return a JSON-safe representation of the run result.
+
+        The runtime may contain Playwright objects, asyncio futures,
+        browser/page handles, Path objects, or other non-picklable values.
+        dataclasses.asdict() performs a deep copy and therefore can crash on
+        those runtime objects. Serialize recursively without deep-copying
+        unsupported objects.
+        """
+        return _json_safe(self)
+
+
+def _json_safe(value: Any, *, _depth: int = 0) -> Any:
+    """Convert runtime values into JSON-safe Python values."""
+    if _depth > 12:
+        return "<max-depth>"
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if is_dataclass(value) and not isinstance(value, type):
+        result: dict[str, Any] = {}
+        for name in value.__dataclass_fields__:
+            try:
+                result[name] = _json_safe(
+                    getattr(value, name),
+                    _depth=_depth + 1,
+                )
+            except Exception:
+                result[name] = "<unserializable>"
+        return result
+
+    if isinstance(value, Mapping):
+        result = {}
+        for key, item in value.items():
+            try:
+                safe_key = str(key)
+            except Exception:
+                safe_key = "<unserializable-key>"
+            result[safe_key] = _json_safe(
+                item,
+                _depth=_depth + 1,
+            )
+        return result
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [
+            _json_safe(item, _depth=_depth + 1)
+            for item in value
+        ]
+
+    # Avoid touching Playwright/asyncio internals. Runtime browser objects
+    # must never be deep-copied into a saved CLI result.
+    module = getattr(type(value), "__module__", "")
+    name = getattr(type(value), "__name__", "object")
+    if (
+        module.startswith("playwright")
+        or module.startswith("asyncio")
+        or "playwright" in module.lower()
+    ):
+        return f"<runtime:{module}.{name}>"
+
+    # Objects that expose a useful to_dict() method can be represented
+    # without invoking dataclasses.asdict()/deepcopy.
+    converter = getattr(value, "to_dict", None)
+    if callable(converter):
+        try:
+            converted = converter()
+            if converted is not value:
+                return _json_safe(
+                    converted,
+                    _depth=_depth + 1,
+                )
+        except Exception:
+            pass
+
+    # Last resort: preserve a readable diagnostic instead of allowing
+    # serialization to crash the entire run.
+    try:
+        return str(value)
+    except Exception:
+        return f"<unserializable:{module}.{name}>"
 
 
 # ============================================================
