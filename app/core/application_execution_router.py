@@ -608,6 +608,7 @@ class ApplicationExecutionRouter:
                     "captcha_detected",
                     "login_required",
                     "human_action_required",
+                    "application_handoff",
                 },
             )
         )
@@ -623,7 +624,7 @@ class ApplicationExecutionRouter:
             "application_result": dict(submitted),
         }
 
-        if success and also_outreach:
+        if also_outreach:
             try:
                 outreach_prepared = self._prepare_outreach(
                     contacts=contacts or [],

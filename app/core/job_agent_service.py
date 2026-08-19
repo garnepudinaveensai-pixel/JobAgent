@@ -424,7 +424,7 @@ class JobAgentService:
             "discovered", "review", "skipped", "prepared",
             "confirmation_required", "applied", "outreach_sent",
             "captcha_detected", "login_required", "human_action_required",
-            "job_unavailable", "form_not_found", "navigation_failed",
+            "application_handoff", "job_unavailable", "form_not_found", "navigation_failed",
             "validation_failed", "application_prepare_failed",
             "submission_timeout", "submission_failed", "send_failed", "error",
         }

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+
+from app.browser.application_navigator import ApplicationNavigator
 from typing import Any, Optional
 
 from playwright.sync_api import (
@@ -56,6 +58,14 @@ class ApplicationSubmitter:
     STATUS_JOB_UNAVAILABLE = "job_unavailable"
     STATUS_FORM_NOT_FOUND = "form_not_found"
     STATUS_FORM_DETECTED = "form_detected"
+    STATUS_APPLY_CONTROL_FOUND = "apply_control_found"
+    # Backward-compatible name used by the application-control tests and
+    # older workflow/router code. Both constants intentionally represent
+    # the same detected Apply control state.
+    STATUS_APPLY_CONTROL_DETECTED = STATUS_APPLY_CONTROL_FOUND
+    STATUS_READY_TO_APPLY = "ready_to_apply"
+    STATUS_APPLICATION_HANDOFF = "application_handoff"
+    STATUS_APPLICATION_ROUTE_NOT_FOUND = "application_route_not_found"
 
     STATUS_READY = "ready_for_submission"
     STATUS_CONFIRMATION_REQUIRED = "confirmation_required"
@@ -164,6 +174,12 @@ class ApplicationSubmitter:
 
         self._resume_uploaded = False
         self._prepared = False
+        self._job_context: dict[str, Any] = {}
+        self._apply_control_label = ""
+        self._direct_apply_control = None
+        self._application_completed = False
+        self._prepared_resume_path = ""
+        self._prepared_fields: dict[str, Any] = {}
 
         self._page_status = (
             self.STATUS_NOT_ANALYZED
@@ -184,6 +200,9 @@ class ApplicationSubmitter:
             "reason": "",
             "signals": [],
         }
+
+    def set_job_context(self, job: Optional[dict[str, Any]] = None) -> None:
+        self._job_context = dict(job or {}) if isinstance(job, dict) else {}
 
     # ========================================================
     # OPEN
@@ -444,6 +463,27 @@ class ApplicationSubmitter:
             return self.get_page_analysis()
 
         # ----------------------------------------------------
+        # APPLY CONTROL / APPLICATION ROUTE
+        # ----------------------------------------------------
+
+        apply_control = self._find_apply_control()
+        if apply_control is not None:
+            self._apply_control_label = self._control_label(apply_control)
+            self._direct_apply_control = apply_control
+            self._set_page_analysis(
+                status=self.STATUS_APPLY_CONTROL_FOUND,
+                safe_for_automation=True,
+                requires_human_action=False,
+                captcha_detected=False,
+                login_required=False,
+                job_unavailable=False,
+                form_found=False,
+                reason=f"Application control detected: {self._apply_control_label}",
+                signals=["application_control_found"],
+            )
+            return self.get_page_analysis()
+
+        # ----------------------------------------------------
         # UNKNOWN / FORM NOT FOUND
         # ----------------------------------------------------
 
@@ -456,12 +496,10 @@ class ApplicationSubmitter:
             job_unavailable=False,
             form_found=False,
             reason=(
-                "No application form was detected "
-                "on the current page."
+                "No application form or usable application control "
+                "was detected on the current page."
             ),
-            signals=[
-                "application_form_not_found"
-            ],
+            signals=["application_form_not_found", "application_control_not_found"],
         )
 
         return self.get_page_analysis()
@@ -781,6 +819,62 @@ class ApplicationSubmitter:
                 signals
             )
         )
+
+    # ========================================================
+    # APPLY CONTROL / ROUTING
+    # ========================================================
+
+    @staticmethod
+    def _control_label(element: Locator) -> str:
+        for attr in ("aria-label", "title", "value", "name"):
+            try:
+                value = (element.get_attribute(attr) or "").strip()
+                if value:
+                    return value
+            except Exception:
+                pass
+        try:
+            return " ".join((element.inner_text() or "").split()).strip()
+        except Exception:
+            return ""
+
+    def _find_apply_control(self) -> Optional[Locator]:
+        try:
+            candidates = self.page.locator('a,button,input[type="submit"],input[type="button"]')
+            for index in range(candidates.count()):
+                element = candidates.nth(index)
+                label = self._control_label(element).lower().strip()
+                if label in {
+                    "apply", "apply now", "apply on company site",
+                    "apply on employer site", "apply on company website",
+                    "apply at company", "apply externally",
+                }:
+                    try:
+                        if element.is_visible(timeout=500):
+                            return element
+                    except Exception:
+                        continue
+        except Exception:
+            return None
+        return None
+
+    def _is_external_apply_control(self) -> bool:
+        label = self._apply_control_label.lower()
+        return any(token in label for token in (
+            "company site", "employer site", "company website", "extern"
+        ))
+
+    def _follow_application_route(self) -> dict:
+        navigator = ApplicationNavigator(self.page, timeout=self.timeout)
+        result = navigator.navigate(self._job_context)
+        status = result.get("status")
+        if status == "form_detected":
+            self.form = self.page.locator(self.form_selector).first
+            self.analyze_page()
+        elif status == "submitted":
+            self._application_completed = True
+            self._page_status = self.STATUS_SUBMITTED
+        return result
 
     # ========================================================
     # FORM
@@ -1436,6 +1530,66 @@ class ApplicationSubmitter:
 
         analysis = self.analyze_page()
 
+        if analysis["status"] == self.STATUS_APPLY_CONTROL_FOUND:
+            if self._is_external_apply_control():
+                route = self._follow_application_route()
+                route_status = route.get("status")
+                if route_status == "form_detected":
+                    analysis = self.analyze_page()
+                elif route_status == "ready_to_apply":
+                    self._prepared = True
+                    self._prepared_resume_path = str(resume_path)
+                    self._prepared_fields = dict(fields or {})
+                    return {
+                        "success": True,
+                        "status": self.STATUS_READY_TO_APPLY,
+                        "message": "Employer site reached its final Apply control; final click is deferred until live submission.",
+                        "page_analysis": self.get_page_analysis(),
+                        "navigation": route,
+                        "filled_fields": [],
+                        "failed_fields": [],
+                        "resume_uploaded": False,
+                        "validation": {"ready": True, "missing_required_fields": [], "resume_uploaded": False},
+                    }
+                elif route_status == "submitted":
+                    return {
+                        "success": True,
+                        "status": self.STATUS_SUBMITTED,
+                        "submitted": True,
+                        "filled_fields": [],
+                        "failed_fields": [],
+                        "resume_uploaded": False,
+                        "validation": {"ready": True, "missing_required_fields": [], "resume_uploaded": False},
+                        "page_analysis": self.get_page_analysis(),
+                        "navigation": route,
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "status": route_status or self.STATUS_APPLICATION_ROUTE_NOT_FOUND,
+                        "message": "The employer application route could not be completed automatically.",
+                        "page_analysis": self.get_page_analysis(),
+                        "navigation": route,
+                        "filled_fields": [],
+                        "failed_fields": [],
+                        "resume_uploaded": False,
+                        "validation": {"ready": False, "missing_required_fields": [], "resume_uploaded": False},
+                    }
+            else:
+                self._prepared = True
+                self._prepared_resume_path = str(resume_path)
+                self._prepared_fields = dict(fields or {})
+                return {
+                    "success": True,
+                    "status": self.STATUS_APPLY_CONTROL_DETECTED,
+                    "message": "Direct Apply control detected; final click is deferred until live submission.",
+                    "page_analysis": analysis,
+                    "filled_fields": [],
+                    "failed_fields": [],
+                    "resume_uploaded": False,
+                    "validation": {"ready": True, "missing_required_fields": [], "resume_uploaded": False},
+                }
+
         blocking_statuses = {
             self.STATUS_LOGIN_REQUIRED,
             self.STATUS_CAPTCHA_DETECTED,
@@ -1483,6 +1637,9 @@ class ApplicationSubmitter:
 
         if fields is None:
             fields = {}
+
+        self._prepared_resume_path = str(resume_path)
+        self._prepared_fields = dict(fields)
 
         if not isinstance(
             fields,
@@ -1630,17 +1787,147 @@ class ApplicationSubmitter:
                 "page_analysis": analysis,
             }
 
-        if (
-            analysis["status"]
-            == self.STATUS_FORM_NOT_FOUND
-        ):
+        if analysis["status"] == self.STATUS_SUBMITTED and self._application_completed:
+            if not confirm:
+                return {
+                    "success": False,
+                    "status": self.STATUS_CONFIRMATION_REQUIRED,
+                    "submitted": False,
+                    "page_analysis": analysis,
+                }
+            return {
+                "success": True,
+                "status": self.STATUS_SUBMITTED,
+                "submitted": True,
+                "page_analysis": analysis,
+            }
+
+        if analysis["status"] == self.STATUS_APPLY_CONTROL_FOUND:
+            # A direct Apply control and an employer-site Apply control use
+            # the same state machine.  The distinction matters for
+            # navigation during preparation, but once the user has explicitly
+            # authorized live execution we must follow the control and inspect
+            # the resulting page instead of treating it as a failed form.
+            if not confirm:
+                return {
+                    "success": False,
+                    "status": self.STATUS_CONFIRMATION_REQUIRED,
+                    "submitted": False,
+                    "page_analysis": analysis,
+                }
+
+            control = self._find_apply_control()
+            if control is None:
+                return {
+                    "success": False,
+                    "status": self.STATUS_APPLICATION_ROUTE_NOT_FOUND,
+                    "page_analysis": analysis,
+                }
+
+            before_url = self._safe_page_url()
+
+            try:
+                control.scroll_into_view_if_needed(timeout=self.timeout)
+                control.click(timeout=self.timeout)
+                try:
+                    self.page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=self.timeout,
+                    )
+                except Exception:
+                    pass
+                try:
+                    self.page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "status": self.STATUS_SUBMISSION_FAILED,
+                    "message": str(exc),
+                    "page_analysis": analysis,
+                }
+
+            # Re-analyze after every transition.  A real application may
+            # expose another Apply step, an application form, a login/CAPTCHA
+            # barrier, or a confirmation page.
+            next_analysis = self.analyze_page()
+
+            if next_analysis["status"] == self.STATUS_FORM_DETECTED:
+                prepared = self.prepare_application(
+                    resume_path=self._prepared_resume_path,
+                    fields=self._prepared_fields,
+                )
+                if prepared.get("success"):
+                    return self.submit(confirm=True)
+                return prepared
+
+            if self._success_visible():
+                self._application_completed = True
+                self._page_status = self.STATUS_SUBMITTED
+                return {
+                    "success": True,
+                    "status": self.STATUS_SUBMITTED,
+                    "submitted": True,
+                    "page_analysis": next_analysis,
+                }
+
+            if next_analysis["status"] == self.STATUS_APPLY_CONTROL_FOUND:
+                return {
+                    "success": True,
+                    "status": self.STATUS_APPLICATION_HANDOFF,
+                    "submitted": False,
+                    "message": (
+                        "The Apply control was activated, but the resulting "
+                        "page still requires another application step. "
+                        "Submission was not claimed."
+                    ),
+                    "page_analysis": next_analysis,
+                }
+
+            if next_analysis["status"] in {
+                self.STATUS_LOGIN_REQUIRED,
+                self.STATUS_CAPTCHA_DETECTED,
+            }:
+                return {
+                    "success": False,
+                    "status": next_analysis["status"],
+                    "submitted": False,
+                    "requires_human_action": True,
+                    "message": next_analysis["reason"],
+                    "page_analysis": next_analysis,
+                }
+
+            # If the URL changed but the new page is not yet classifiable,
+            # report a handoff rather than falsely claiming failure or
+            # submission.  This is particularly useful for employer ATS
+            # redirects that finish rendering asynchronously.
+            if self._safe_page_url() != before_url:
+                return {
+                    "success": True,
+                    "status": self.STATUS_APPLICATION_HANDOFF,
+                    "submitted": False,
+                    "message": (
+                        "The application route advanced to a new page, "
+                        "but submission has not yet been confirmed."
+                    ),
+                    "page_analysis": next_analysis,
+                }
 
             return {
                 "success": False,
+                "status": next_analysis.get(
+                    "status",
+                    self.STATUS_APPLICATION_ROUTE_NOT_FOUND,
+                ),
+                "page_analysis": next_analysis,
+            }
+
+        if analysis["status"] == self.STATUS_FORM_NOT_FOUND:
+            return {
+                "success": False,
                 "status": self.STATUS_FORM_NOT_FOUND,
-                "message": analysis[
-                    "reason"
-                ],
+                "message": analysis["reason"],
                 "page_analysis": analysis,
             }
 
@@ -1707,26 +1994,26 @@ class ApplicationSubmitter:
             }
 
         # ----------------------------------------------------
-        # Find submit button
+        # Find the actual submission control
         # ----------------------------------------------------
+        #
+        # Some employer forms place the submit control outside the <form>
+        # element (common with JS/React form builders).  Looking only inside
+        # ``form`` therefore produces the misleading ``submit_button_not_found``
+        # result even though a real Submit/Apply control is present on the
+        # page.  Prefer controls inside the form, then fall back to the page.
+        submit_button = self._find_submission_control(form)
 
-        submit_button = form.locator(
-            'button[type="submit"], '
-            'input[type="submit"], '
-            'button:has-text("Submit"), '
-            'button:has-text("Apply")'
-        ).first
-
-        if submit_button.count() == 0:
+        if submit_button is None:
 
             return {
                 "success": False,
-                "status": (
-                    "submit_button_not_found"
+                "status": "submit_button_not_found",
+                "message": (
+                    "The application page was prepared, but no reliable "
+                    "Submit/Apply control could be identified."
                 ),
-                "page_analysis": (
-                    self.get_page_analysis()
-                ),
+                "page_analysis": self.get_page_analysis(),
             }
 
         # ----------------------------------------------------
@@ -1735,22 +2022,100 @@ class ApplicationSubmitter:
 
         try:
 
+            before_url = self._safe_page_url()
+
+            submit_button.scroll_into_view_if_needed(
+                timeout=self.timeout
+            )
             submit_button.click(
                 timeout=self.timeout
             )
 
-            self._page_status = (
-                self.STATUS_SUBMITTED
-            )
+            try:
+                self.page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=self.timeout,
+                )
+            except Exception:
+                pass
+
+            try:
+                self.page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
+            # Never equate a successful click with a successful application.
+            # Re-analyze the resulting page and only report ``submitted`` when
+            # a confirmation signal is visible OR when this was a real native/
+            # server form submission that navigated away and the application
+            # form disappeared. The latter is important for simple/ATS forms
+            # that redirect to a URL without rendering a "Thank you" message.
+            after_analysis = self.analyze_page()
+
+            after_url = self._safe_page_url()
+            form_still_present = self._form_exists()
+
+            if self._success_visible():
+                self._application_completed = True
+                self._page_status = self.STATUS_SUBMITTED
+                return {
+                    "success": True,
+                    "status": self.STATUS_SUBMITTED,
+                    "submitted": True,
+                    "page_analysis": after_analysis,
+                }
+
+            if (
+                after_url != before_url
+                and not form_still_present
+                and after_analysis["status"] == self.STATUS_FORM_NOT_FOUND
+            ):
+                self._application_completed = True
+                self._page_status = self.STATUS_SUBMITTED
+                return {
+                    "success": True,
+                    "status": self.STATUS_SUBMITTED,
+                    "submitted": True,
+                    "message": (
+                        "The application form was submitted and the page "
+                        "navigated away from the form without exposing a "
+                        "separate confirmation message."
+                    ),
+                    "page_analysis": after_analysis,
+                }
+
+            if after_analysis["status"] in {
+                self.STATUS_LOGIN_REQUIRED,
+                self.STATUS_CAPTCHA_DETECTED,
+            }:
+                return {
+                    "success": False,
+                    "status": after_analysis["status"],
+                    "submitted": False,
+                    "requires_human_action": True,
+                    "page_analysis": after_analysis,
+                }
+
+            # A successful click may leave the browser on a pending/ATS
+            # transition page.  Treat that as a handoff rather than claiming
+            # submission.
+            if after_analysis["status"] == self.STATUS_APPLY_CONTROL_FOUND:
+                return {
+                    "success": True,
+                    "status": self.STATUS_APPLICATION_HANDOFF,
+                    "submitted": False,
+                    "page_analysis": after_analysis,
+                }
 
             return {
                 "success": True,
-                "status": (
-                    self.STATUS_SUBMITTED
+                "status": self.STATUS_APPLICATION_HANDOFF,
+                "submitted": False,
+                "message": (
+                    "The submission control was activated, but the page "
+                    "did not expose a confirmation signal."
                 ),
-                "page_analysis": (
-                    self.get_page_analysis()
-                ),
+                "page_analysis": after_analysis,
             }
 
         except PlaywrightTimeoutError:
@@ -1785,6 +2150,144 @@ class ApplicationSubmitter:
                     self.get_page_analysis()
                 ),
             }
+
+    def _find_submission_control(self, form: Locator) -> Optional[Locator]:
+        """
+        Find a likely final application-submit control.
+
+        Employer ATS pages are inconsistent: the final control may be inside
+        the form, outside it, a <button type="button"> driven by JavaScript,
+        or an ARIA button.  We therefore inspect the form first and then the
+        whole document.
+
+        Deliberately conservative: navigation/filter controls are rejected so
+        that "Apply filters" is never mistaken for a job application.
+        """
+        reject_tokens = {
+            "apply filters",
+            "filter",
+            "search",
+            "save",
+            "cancel",
+            "close",
+            "back",
+            "previous",
+            "sign in",
+            "login",
+            "register",
+            "create account",
+        }
+
+        strong = (
+            "submit application",
+            "submit your application",
+            "submit application form",
+            "send application",
+            "send your application",
+            "complete application",
+            "finish application",
+            "submit",
+        )
+        medium = (
+            "apply now",
+            "apply",
+            "finish",
+            "complete",
+        )
+
+        def label(element: Locator) -> str:
+            return self._control_label(element).strip()
+
+        def score(element: Locator) -> int:
+            text = label(element).lower()
+            if not text or any(token in text for token in reject_tokens):
+                return -1
+
+            score_value = 0
+            if any(token == text for token in strong):
+                score_value = 100
+            elif any(token in text for token in strong):
+                score_value = 90
+            elif any(token == text for token in medium):
+                score_value = 80
+            elif any(token in text for token in medium):
+                score_value = 70
+
+            # A submit-type control is useful even when its visible label is
+            # empty, but only after stronger text-labelled controls.
+            try:
+                control_type = (
+                    element.get_attribute("type") or ""
+                ).lower()
+            except Exception:
+                control_type = ""
+
+            if control_type == "submit":
+                score_value = max(score_value, 75)
+
+            return score_value
+
+        selectors = (
+            'button, input[type="submit"], input[type="button"], '
+            '[role="button"]'
+        )
+
+        best: Optional[Locator] = None
+        best_score = -1
+
+        # Search the actual form first.
+        containers = [form]
+        try:
+            if form.count() == 0:
+                containers = []
+        except Exception:
+            containers = []
+
+        # Then search the entire document because some JS form builders put
+        # the final action outside <form>.
+        containers.append(self.page.locator("body"))
+
+        seen = set()
+        for container in containers:
+            try:
+                candidates = container.locator(selectors)
+                count = candidates.count()
+            except Exception:
+                continue
+
+            for index in range(count):
+                element = candidates.nth(index)
+                try:
+                    element_id = element.get_attribute("id") or ""
+                    element_name = element.get_attribute("name") or ""
+                    key = (element_id, element_name, label(element))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    if not element.is_visible(timeout=500):
+                        continue
+
+                    current_score = score(element)
+                    if current_score > best_score:
+                        best = element
+                        best_score = current_score
+                except Exception:
+                    continue
+
+        return best if best_score >= 70 else None
+
+    def _success_visible(self) -> bool:
+        try:
+            text = self.page.locator("body").inner_text(timeout=1000)
+        except Exception:
+            return False
+        lowered = (text or "").lower()
+        return any(phrase in lowered for phrase in (
+            "application submitted", "application received",
+            "thank you for applying", "successfully applied",
+            "application complete",
+        ))
 
     # ========================================================
     # HUMAN ACTION
@@ -1838,6 +2341,11 @@ class ApplicationSubmitter:
         self._resume_input = None
         self._resume_uploaded = False
         self._prepared = False
+        self._apply_control_label = ""
+        self._direct_apply_control = None
+        self._application_completed = False
+        self._prepared_resume_path = ""
+        self._prepared_fields = {}
 
         self._page_status = (
             self.STATUS_NOT_ANALYZED

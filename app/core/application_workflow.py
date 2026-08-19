@@ -129,16 +129,35 @@ class ApplicationWorkflow:
             page
         )
 
+        set_context = getattr(
+            submitter,
+            "set_job_context",
+            None,
+        )
+        if callable(set_context):
+            set_context(job)
+
         submitter.open(
             job_url
         )
+
+        # When the caller does not provide explicit answers, safely derive
+        # only facts already present in the selected resume. We never guess
+        # work authorization, salary, notice period, relocation, or other
+        # consequential answers. Unknown required questions remain visible
+        # for human action.
+        effective_fields = dict(fields or {})
+        if not effective_fields:
+            for key, value in self._resume_field_values(resume).items():
+                if value not in (None, ""):
+                    effective_fields[key] = value
 
         prepared = (
             submitter.prepare_application(
                 resume_path=resume_result[
                     "pdf_path"
                 ],
-                fields=fields,
+                fields=effective_fields,
             )
         )
 
@@ -190,6 +209,53 @@ class ApplicationWorkflow:
             ),
             "submitter": submitter,
         }
+
+    @staticmethod
+    def _resume_field_values(resume: Dict) -> Dict[str, str]:
+        values: Dict[str, str] = {}
+        if not isinstance(resume, dict):
+            return values
+
+        name = str(resume.get("name", "") or "").strip()
+        email = str(resume.get("email", "") or "").strip()
+        phone = str(resume.get("phone", "") or "").strip()
+        degree = str(resume.get("degree", "") or "").strip()
+
+        if name:
+            values.update({
+                "Name": name,
+                "Full Name": name,
+                "Full name": name,
+                "Candidate Name": name,
+            })
+            parts = name.split()
+            if len(parts) >= 2:
+                values["First Name"] = parts[0]
+                values["Last Name"] = " ".join(parts[1:])
+
+        if email:
+            values.update({
+                "Email": email,
+                "Email Address": email,
+                "Email address": email,
+            })
+
+        if phone:
+            values.update({
+                "Phone": phone,
+                "Phone Number": phone,
+                "Mobile": phone,
+                "Mobile Number": phone,
+            })
+
+        if degree:
+            values.update({
+                "Degree": degree,
+                "Highest Education": degree,
+                "Education": degree,
+            })
+
+        return values
 
     # ========================================================
     # SUBMIT

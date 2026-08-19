@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
+from app.core.job_intelligence import JobIntelligence
+
 
 # ============================================================
 # DECISIONS
@@ -248,6 +250,28 @@ class ApplicationDecisionEngine:
                 match,
             )
         )
+
+        intelligence = JobIntelligence.analyze(job)
+
+        # Hard role guard: the agent must not apply to sales, BD, HR,
+        # marketing, plumbing/mixed roles, or other explicitly excluded
+        # non-technical positions merely because resume similarity happens
+        # to produce a high score.
+        if not intelligence["technical_target"]:
+            return self._result(
+                decision=SKIP,
+                reason=(
+                    "The role was classified as non-target or uncertain "
+                    "for the configured technical/software job strategy."
+                ),
+                ranking_score=ranking_score,
+                match_score=match_score,
+                eligible=eligible,
+                missing_required_skills=missing_required,
+                application_url=application_url,
+                selected_resume=selected_resume,
+                metadata={"job_intelligence": intelligence},
+            )
 
         # ----------------------------------------------------
         # INELIGIBLE
@@ -703,6 +727,7 @@ class ApplicationDecisionEngine:
         missing_required_skills: tuple[str, ...],
         application_url: str,
         selected_resume: Optional[dict],
+        metadata: Optional[dict[str, Any]] = None,
     ) -> ApplicationDecision:
 
         recommended_action = {
@@ -724,6 +749,7 @@ class ApplicationDecisionEngine:
             application_url=application_url,
             selected_resume=selected_resume,
             recommended_action=recommended_action,
+            metadata=dict(metadata or {}),
         )
 
 

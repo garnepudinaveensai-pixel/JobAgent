@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from app.core.job_intelligence import JobIntelligence
+
 
 class JobRanker:
     """
@@ -109,6 +111,10 @@ class JobRanker:
                 breakdown
             )
 
+            intelligence = JobIntelligence.analyze(job)
+            ranked_result["job_intelligence"] = intelligence
+            ranked_result["priority_score"] = intelligence["priority_score"]
+
             ranked.append(
                 ranked_result
             )
@@ -164,6 +170,10 @@ class JobRanker:
         filtered: list[dict] = []
 
         for result in ranked:
+
+            intelligence = result.get("job_intelligence", {})
+            if isinstance(intelligence, dict) and intelligence.get("technical_target") is False:
+                continue
 
             score = result.get(
                 "ranking_score",
@@ -672,7 +682,12 @@ class JobRanker:
         ):
             resume_score = 0
 
+        priority = result.get("priority_score", 0.0)
+        if not isinstance(priority, (int, float)):
+            priority = 0.0
+
         return (
+            float(priority),
             float(score),
             float(resume_score),
         )
