@@ -12,25 +12,22 @@ class JobIntelligence:
     """
     Explainable AI-style job reasoning layer.
 
-    Responsibilities:
+    Pipeline:
 
-        job observation
-            ↓
-        role classification
-            ↓
-        contradiction detection
-            ↓
-        freshness analysis
-            ↓
-        urgency analysis
-            ↓
-        application-route detection
-            ↓
-        match/eligibility analysis
-            ↓
-        priority calculation
-            ↓
+        Job
+          ↓
+        Role classification
+          ↓
+        Freshness / urgency
+          ↓
+        Candidate fit
+          ↓
+        Adaptive priority
+          ↓
         APPLY / REVIEW / SKIP
+
+    The class remains deterministic and does not make external
+    network or LLM calls.
     """
 
     EXCLUDED_TITLE_TERMS = (
@@ -39,9 +36,7 @@ class JobIntelligence:
 
     TARGET_TITLE_TERMS = tuple(
         signal
-        for signals in (
-            LocalAgentBrain.ROLE_SIGNALS.values()
-        )
+        for signals in LocalAgentBrain.ROLE_SIGNALS.values()
         for signal in signals
     )
 
@@ -151,11 +146,17 @@ class JobIntelligence:
             f"{title} {description}"
         )
 
-        brain = (
-            LocalAgentBrain.classify_job(
-                job
-            )
+        # --------------------------------------------------------
+        # 1. Role intelligence
+        # --------------------------------------------------------
+
+        brain = LocalAgentBrain.classify_job(
+            job
         )
+
+        # --------------------------------------------------------
+        # 2. Freshness / urgency
+        # --------------------------------------------------------
 
         freshness = cls._freshness_score(
             combined,
@@ -166,39 +167,32 @@ class JobIntelligence:
             combined.lower()
         )
 
+        # --------------------------------------------------------
+        # 3. Application route
+        # --------------------------------------------------------
+
         route = cls._application_route(
             url,
             job,
         )
 
         # --------------------------------------------------------
-        # Match information
+        # 4. Match information
         # --------------------------------------------------------
 
         match = job.get("match")
 
-        match_available = isinstance(
+        if not isinstance(
             match,
             Mapping,
-        )
-
-        if not match_available:
+        ):
             match = {}
 
-        eligible_value = match.get(
+        eligible = match.get(
             "eligible"
         )
 
-        if eligible_value is True:
-            eligibility_score = 100.0
-        elif eligible_value is None:
-            # Unknown eligibility is not the same as
-            # ineligible. Keep it reviewable.
-            eligibility_score = 55.0
-        else:
-            eligibility_score = 0.0
-
-        raw_match_score = match.get(
+        match_score_raw = match.get(
             "match_score",
             match.get(
                 "resume_score",
@@ -206,46 +200,109 @@ class JobIntelligence:
             ),
         )
 
-        match_score: float | None
+        missing_required_skills = (
+            match.get(
+                "missing_required_skills",
+                [],
+            )
+        )
 
-        if raw_match_score is None:
-            match_score = None
-        else:
+        # --------------------------------------------------------
+        # 5. Candidate-fit intelligence
+        # --------------------------------------------------------
+
+        candidate_fit = (
+            LocalAgentBrain.evaluate_candidate_fit(
+                intent=brain.intent,
+                confidence=brain.confidence,
+                match_score=match_score_raw,
+                eligible=eligible,
+                missing_required_skills=(
+                    missing_required_skills
+                ),
+            )
+        )
+
+        # --------------------------------------------------------
+        # 6. Normalize match score for priority/action
+        # --------------------------------------------------------
+
+        match_available = (
+            match_score_raw is not None
+        )
+
+        if match_available:
             try:
                 match_score = float(
-                    raw_match_score
+                    match_score_raw
                 )
             except (
                 TypeError,
                 ValueError,
             ):
-                match_score = None
+                match_score = 0.0
+                match_available = False
+        else:
+            match_score = 0.0
 
-        # Priority calculation requires a numeric value.
-        # Missing matching data contributes zero, but it does
-        # NOT cause the job to be rejected.
-        priority_match_score = (
-            match_score
-            if match_score is not None
-            else 0.0
+        match_score = max(
+            0.0,
+            min(
+                100.0,
+                match_score,
+            ),
         )
+
+        # --------------------------------------------------------
+        # 7. Eligibility score for priority
+        # --------------------------------------------------------
+
+        eligibility_score = candidate_fit[
+            "eligibility_score"
+        ]
+
+        # --------------------------------------------------------
+        # 8. Adaptive priority
+        # --------------------------------------------------------
 
         priority = (
             LocalAgentBrain.rank_priority(
                 target=brain.target,
                 freshness=freshness,
                 urgency=urgency,
-                match_score=priority_match_score,
+                match_score=match_score,
                 eligibility=eligibility_score,
             )
         )
 
         # --------------------------------------------------------
-        # Reasoning
+        # 9. Recommended action
+        # --------------------------------------------------------
+
+        recommended_action = (
+            LocalAgentBrain.choose_action(
+                technical_target=brain.target,
+                eligible=(
+                    eligible is not False
+                ),
+                score=(
+                    match_score
+                    if match_available
+                    else None
+                ),
+                application_status=cls._text(
+                    job.get("status")
+                ),
+                match_available=match_available,
+            )
+        )
+
+        # --------------------------------------------------------
+        # 10. Explainable priority reasoning
         # --------------------------------------------------------
 
         reasons = [
-            brain.reason
+            brain.reason,
         ]
 
         if freshness >= 80:
@@ -262,66 +319,33 @@ class JobIntelligence:
                 "active/urgent hiring signal"
             )
 
-        if match_available:
-            if match_score is None:
-                reasons.append(
-                    "match data present but score unavailable"
-                )
-            else:
-                reasons.append(
-                    f"resume match={match_score:.1f}"
-                )
-        else:
-            reasons.append(
-                "resume match not evaluated yet"
-            )
+        reasons.append(
+            f"candidate_fit="
+            f"{candidate_fit['fit_level']}"
+        )
 
-        if eligible_value is True:
+        reasons.append(
+            f"candidate_fit_score="
+            f"{candidate_fit['candidate_fit_score']:.1f}"
+        )
+
+        if candidate_fit[
+            "missing_required_skills"
+        ]:
             reasons.append(
-                "eligibility confirmed"
-            )
-        elif eligible_value is None:
-            reasons.append(
-                "eligibility not yet confirmed"
-            )
-        else:
-            reasons.append(
-                "eligibility failed"
+                "required skills missing"
             )
 
         reasons.append(
             f"route={route}"
         )
 
-        # --------------------------------------------------------
-        # Action decision
-        # --------------------------------------------------------
-
-        # Closed/expired/duplicate jobs are always skipped.
-        # Non-target roles are always skipped.
-        # Missing match data goes to REVIEW.
-        recommended_action = (
-            LocalAgentBrain.choose_action(
-                technical_target=brain.target,
-                eligible=(
-                    eligible_value is not False
-                ),
-                score=match_score,
-                application_status=cls._text(
-                    job.get("status")
-                ),
-                match_available=match_available,
-            )
-        )
-
-        # --------------------------------------------------------
-        # Result
-        # --------------------------------------------------------
-
         return {
-            "technical_target": (
-                brain.target
-            ),
+            # ----------------------------------------------------
+            # Role intelligence
+            # ----------------------------------------------------
+
+            "technical_target": brain.target,
 
             "role_class": (
                 brain.intent
@@ -346,45 +370,97 @@ class JobIntelligence:
                 brain.matched_signals
             ),
 
-            "freshness_score": (
-                freshness
+            "role_score": (
+                brain.role_score
             ),
 
-            "urgency_score": (
-                urgency
+            "technical_score": (
+                brain.technical_score
             ),
 
-            "priority_score": (
-                priority
+            "contradiction_score": (
+                brain.contradiction_score
             ),
 
-            "application_route": (
-                route
+            "seniority": (
+                brain.seniority
             ),
 
-            "match_available": (
-                match_available
+            "evidence_strength": (
+                brain.evidence_strength
             ),
 
-            "match_score": (
-                match_score
+            # ----------------------------------------------------
+            # Freshness / urgency
+            # ----------------------------------------------------
+
+            "freshness_score": freshness,
+
+            "urgency_score": urgency,
+
+            # ----------------------------------------------------
+            # Candidate fit
+            # ----------------------------------------------------
+
+            "candidate_fit_score": (
+                candidate_fit[
+                    "candidate_fit_score"
+                ]
             ),
 
-            "eligibility": (
-                eligible_value
+            "fit_confidence": (
+                candidate_fit[
+                    "fit_confidence"
+                ]
             ),
+
+            "fit_level": (
+                candidate_fit[
+                    "fit_level"
+                ]
+            ),
+
+            "missing_required_skills": list(
+                candidate_fit[
+                    "missing_required_skills"
+                ]
+            ),
+
+            "eligibility_score": (
+                candidate_fit[
+                    "eligibility_score"
+                ]
+            ),
+
+            "fit_reason": (
+                candidate_fit[
+                    "fit_reason"
+                ]
+            ),
+
+            # ----------------------------------------------------
+            # Priority / action
+            # ----------------------------------------------------
+
+            "priority_score": priority,
 
             "priority_reason": (
-                "; ".join(reasons)
+                "; ".join(
+                    reasons
+                )
             ),
 
             "recommended_action": (
                 recommended_action
             ),
 
-            "company": (
-                company
-            ),
+            # ----------------------------------------------------
+            # Application route / metadata
+            # ----------------------------------------------------
+
+            "application_route": route,
+
+            "company": company,
         }
 
     # ============================================================
@@ -476,14 +552,9 @@ class JobIntelligence:
 
                 return 5
 
-            except (
-                TypeError,
-                ValueError,
-            ):
+            except ValueError:
                 continue
 
-        # Unknown posting date should not be treated as
-        # extremely old. Give it a neutral baseline.
         return 40
 
     # ============================================================
@@ -551,11 +622,9 @@ class JobIntelligence:
         }:
             return "employer_ats"
 
-        host = (
-            urlparse(url)
-            .netloc
-            .lower()
-        )
+        host = urlparse(
+            url
+        ).netloc.lower()
 
         if host:
             return "job_page"

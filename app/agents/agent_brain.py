@@ -6,9 +6,7 @@ from typing import Any, Mapping
 
 @dataclass(frozen=True)
 class BrainDecision:
-    """
-    Explainable result produced by the local job reasoning engine.
-    """
+    """Explainable result produced by the local job reasoning engine."""
 
     intent: str
     confidence: float
@@ -23,6 +21,11 @@ class BrainDecision:
     seniority: str = "unknown"
     evidence_strength: str = "weak"
 
+    candidate_fit_score: float = 0.0
+    fit_confidence: float = 0.0
+    missing_required_skills: tuple[str, ...] = ()
+    eligibility_score: float = 0.0
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -33,10 +36,6 @@ class LocalAgentBrain:
 
     No external APIs, LLM calls, API keys, or network requests.
     """
-
-    # ============================================================
-    # ROLE PROFILES
-    # ============================================================
 
     ROLE_SIGNALS = {
         "software": (
@@ -115,10 +114,6 @@ class LocalAgentBrain:
             "data science",
         ),
     }
-
-    # ============================================================
-    # ROLE-SPECIFIC TECHNICAL SIGNALS
-    # ============================================================
 
     ROLE_TECHNICAL_SIGNALS = {
         "electrical_core": (
@@ -202,10 +197,6 @@ class LocalAgentBrain:
         ),
     }
 
-    # ============================================================
-    # GLOBAL TECHNICAL EVIDENCE
-    # ============================================================
-
     TECHNICAL_DESCRIPTION = (
         "python",
         "embedded",
@@ -239,10 +230,6 @@ class LocalAgentBrain:
         "renewable energy",
         "solar",
     )
-
-    # ============================================================
-    # HARD EXCLUSIONS
-    # ============================================================
 
     NEGATIVE_TITLE = (
         "sales",
@@ -284,10 +271,6 @@ class LocalAgentBrain:
         "generate leads",
     )
 
-    # ============================================================
-    # CONTRADICTORY DOMAINS
-    # ============================================================
-
     CONTRADICTORY_DOMAINS = {
         "plumbing": (
             "plumbing",
@@ -314,10 +297,6 @@ class LocalAgentBrain:
             "lead generation",
         ),
     }
-
-    # ============================================================
-    # SENIORITY
-    # ============================================================
 
     SENIORITY_SIGNALS = {
         "intern": (
@@ -363,10 +342,6 @@ class LocalAgentBrain:
         ),
     }
 
-    # ============================================================
-    # NORMALIZATION
-    # ============================================================
-
     @staticmethod
     def text(value: Any) -> str:
         return " ".join(
@@ -380,10 +355,6 @@ class LocalAgentBrain:
     ) -> str:
         return cls.text(value).lower()
 
-    # ============================================================
-    # SIGNAL MATCHING
-    # ============================================================
-
     @classmethod
     def _find_signals(
         cls,
@@ -396,17 +367,12 @@ class LocalAgentBrain:
             if signal in text
         )
 
-    # ============================================================
-    # ROLE SCORING
-    # ============================================================
-
     @classmethod
     def _role_scores(
         cls,
         title: str,
         description: str,
     ) -> dict[str, float]:
-
         scores: dict[str, float] = {}
 
         for role, signals in cls.ROLE_SIGNALS.items():
@@ -436,17 +402,12 @@ class LocalAgentBrain:
 
         return scores
 
-    # ============================================================
-    # SENIORITY
-    # ============================================================
-
     @classmethod
     def _detect_seniority(
         cls,
         title: str,
         description: str,
     ) -> str:
-
         title_scores = {
             level: sum(
                 1
@@ -467,7 +428,6 @@ class LocalAgentBrain:
             in cls.SENIORITY_SIGNALS.items()
         }
 
-        # Title evidence is more reliable than description evidence.
         scores = {
             level: (
                 title_scores[level] * 3
@@ -486,10 +446,6 @@ class LocalAgentBrain:
 
         return best_level
 
-    # ============================================================
-    # CONTRADICTIONS
-    # ============================================================
-
     @classmethod
     def _contradictions(
         cls,
@@ -497,7 +453,6 @@ class LocalAgentBrain:
         description: str,
         role: str | None,
     ) -> tuple[str, ...]:
-
         contradictions: list[str] = []
 
         combined = (
@@ -511,9 +466,7 @@ class LocalAgentBrain:
                 signal in combined
                 for signal in signals
             ):
-                contradictions.append(
-                    domain
-                )
+                contradictions.append(domain)
 
         if (
             role
@@ -532,16 +485,181 @@ class LocalAgentBrain:
             )
         )
 
-    # ============================================================
-    # CLASSIFICATION
-    # ============================================================
+    @classmethod
+    def evaluate_candidate_fit(
+        cls,
+        *,
+        intent: str,
+        confidence: float,
+        match_score: float | None = None,
+        eligible: bool | None = None,
+        missing_required_skills: Any = None,
+    ) -> dict[str, Any]:
+        """Interpret resume/job matching information."""
+
+        if match_score is None:
+            normalized_match = None
+        else:
+            try:
+                normalized_match = max(
+                    0.0,
+                    min(
+                        100.0,
+                        float(match_score),
+                    ),
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                normalized_match = None
+
+        if eligible is None:
+            eligibility_score = 50.0
+        elif eligible:
+            eligibility_score = 100.0
+        else:
+            eligibility_score = 0.0
+
+        if isinstance(
+            missing_required_skills,
+            str,
+        ):
+            missing = (
+                [missing_required_skills]
+                if missing_required_skills.strip()
+                else []
+            )
+        elif isinstance(
+            missing_required_skills,
+            (
+                list,
+                tuple,
+                set,
+            ),
+        ):
+            missing = [
+                cls.text(item)
+                for item in missing_required_skills
+                if cls.text(item)
+            ]
+        else:
+            missing = []
+
+        if normalized_match is None:
+            fit_score = 0.0
+            fit_confidence = 0.25
+            fit_level = "unknown"
+        else:
+            fit_score = (
+                normalized_match * 0.70
+                + eligibility_score * 0.30
+            )
+
+            if missing:
+                penalty = min(
+                    30.0,
+                    len(missing) * 10.0,
+                )
+                fit_score -= penalty
+
+            fit_score = max(
+                0.0,
+                min(
+                    100.0,
+                    fit_score,
+                ),
+            )
+
+            fit_confidence = min(
+                0.99,
+                max(
+                    0.30,
+                    (
+                        confidence * 0.55
+                        + normalized_match
+                        / 100.0
+                        * 0.45
+                    ),
+                ),
+            )
+
+            if fit_score >= 90:
+                fit_level = "excellent"
+            elif fit_score >= 75:
+                fit_level = "strong"
+            elif fit_score >= 55:
+                fit_level = "moderate"
+            else:
+                fit_level = "weak"
+
+        reasons: list[str] = []
+
+        if intent not in {
+            "non_target",
+            "uncertain",
+        }:
+            reasons.append(
+                f"role_fit={intent}"
+            )
+
+        if normalized_match is None:
+            reasons.append(
+                "match_score=unknown"
+            )
+        else:
+            reasons.append(
+                f"match_score={normalized_match:.1f}"
+            )
+
+        if eligible is True:
+            reasons.append(
+                "eligibility=confirmed"
+            )
+        elif eligible is False:
+            reasons.append(
+                "eligibility=failed"
+            )
+        else:
+            reasons.append(
+                "eligibility=unknown"
+            )
+
+        if missing:
+            reasons.append(
+                "missing_required="
+                + ", ".join(
+                    missing[:5]
+                )
+            )
+
+        return {
+            "candidate_fit_score": round(
+                fit_score,
+                2,
+            ),
+            "fit_confidence": round(
+                fit_confidence,
+                3,
+            ),
+            "fit_level": fit_level,
+            "missing_required_skills": tuple(
+                missing
+            ),
+            "eligibility_score": round(
+                eligibility_score,
+                2,
+            ),
+            "fit_reason": "; ".join(
+                reasons
+            ),
+        }
 
     @classmethod
     def classify_job(
         cls,
         job: Mapping[str, Any],
     ) -> BrainDecision:
-
         if not isinstance(
             job,
             Mapping,
@@ -571,10 +689,6 @@ class LocalAgentBrain:
                 evidence_strength="none",
             )
 
-        # --------------------------------------------------------
-        # Exclusions
-        # --------------------------------------------------------
-
         negative_title = cls._find_signals(
             title,
             cls.NEGATIVE_TITLE,
@@ -593,10 +707,6 @@ class LocalAgentBrain:
                 )
             )
         )
-
-        # --------------------------------------------------------
-        # Role evidence
-        # --------------------------------------------------------
 
         role_scores = cls._role_scores(
             title,
@@ -627,8 +737,6 @@ class LocalAgentBrain:
 
             role, role_score = ranked_roles[0]
 
-            # A specific role title is stronger evidence than
-            # transferable technical keywords in a description.
             specific_title_role = None
 
             for (
@@ -644,33 +752,20 @@ class LocalAgentBrain:
                     )
                     break
 
-            # Generic titles such as "Technical Engineer"
-            # should not be forced into a specific family merely
-            # because the description contains electrical-adjacent
-            # maintenance signals.
             if (
                 specific_title_role is None
                 and role_score < 12.0
             ):
                 role = None
                 role_score = 0.0
-
         else:
             role = None
             role_score = 0.0
-
-        # --------------------------------------------------------
-        # Seniority
-        # --------------------------------------------------------
 
         seniority = cls._detect_seniority(
             title,
             description,
         )
-
-        # --------------------------------------------------------
-        # Contradictions
-        # --------------------------------------------------------
 
         contradictions = cls._contradictions(
             title,
@@ -686,10 +781,6 @@ class LocalAgentBrain:
                 "mechanical",
             )
         )
-
-        # --------------------------------------------------------
-        # HARD TITLE EXCLUSION
-        # --------------------------------------------------------
 
         if negative_title:
             return BrainDecision(
@@ -714,10 +805,6 @@ class LocalAgentBrain:
                 seniority=seniority,
                 evidence_strength="very_strong",
             )
-
-        # --------------------------------------------------------
-        # MIXED DOMAIN EXCLUSION
-        # --------------------------------------------------------
 
         if mixed_domain:
             return BrainDecision(
@@ -751,10 +838,6 @@ class LocalAgentBrain:
                 evidence_strength="very_strong",
             )
 
-        # --------------------------------------------------------
-        # SALES / NON-TECHNICAL DESCRIPTION
-        # --------------------------------------------------------
-
         if (
             negative_description
             and role is None
@@ -780,10 +863,6 @@ class LocalAgentBrain:
                 evidence_strength="strong",
             )
 
-        # --------------------------------------------------------
-        # No useful evidence
-        # --------------------------------------------------------
-
         if (
             role is None
             and not technical_hits
@@ -805,10 +884,6 @@ class LocalAgentBrain:
                 seniority=seniority,
                 evidence_strength="none",
             )
-
-        # --------------------------------------------------------
-        # Generic technical role
-        # --------------------------------------------------------
 
         if role is None:
             technical_score = min(
@@ -847,10 +922,6 @@ class LocalAgentBrain:
                     else "moderate"
                 ),
             )
-
-        # --------------------------------------------------------
-        # Role-specific reasoning
-        # --------------------------------------------------------
 
         technical_hits_for_role = cls._find_signals(
             f"{title} {description}",
@@ -973,10 +1044,6 @@ class LocalAgentBrain:
             ),
         )
 
-    # ============================================================
-    # PRIORITY
-    # ============================================================
-
     @classmethod
     def rank_priority(
         cls,
@@ -987,15 +1054,72 @@ class LocalAgentBrain:
         match_score: float = 0.0,
         eligibility: float = 100.0,
     ) -> float:
+        """
+        Calculate bounded adaptive job priority.
+
+        Factors:
+            freshness
+            urgency
+            candidate/job match
+            eligibility
+
+        Eligibility:
+            100 -> confirmed eligible
+            55  -> unknown
+            0   -> confirmed ineligible
+
+        Unknown eligibility remains discoverable for REVIEW.
+        Confirmed ineligible jobs are strongly suppressed.
+        """
 
         if not target:
             return 0.0
+
+        try:
+            freshness = float(
+                freshness
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            freshness = 0.0
+
+        try:
+            urgency = float(
+                urgency
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            urgency = 0.0
+
+        try:
+            match_score = float(
+                match_score
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            match_score = 0.0
+
+        try:
+            eligibility = float(
+                eligibility
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            eligibility = 0.0
 
         freshness = max(
             0.0,
             min(
                 100.0,
-                float(freshness),
+                freshness,
             ),
         )
 
@@ -1003,7 +1127,7 @@ class LocalAgentBrain:
             0.0,
             min(
                 100.0,
-                float(urgency),
+                urgency,
             ),
         )
 
@@ -1011,7 +1135,7 @@ class LocalAgentBrain:
             0.0,
             min(
                 100.0,
-                float(match_score),
+                match_score,
             ),
         )
 
@@ -1019,14 +1143,14 @@ class LocalAgentBrain:
             0.0,
             min(
                 100.0,
-                float(eligibility),
+                eligibility,
             ),
         )
 
-        value = (
-            freshness * 0.35
-            + urgency * 0.25
-            + match_score * 0.25
+        base_score = (
+            freshness * 0.30
+            + urgency * 0.20
+            + match_score * 0.35
             + eligibility * 0.15
         )
 
@@ -1034,28 +1158,44 @@ class LocalAgentBrain:
             freshness >= 80
             and urgency >= 40
         ):
-            value += 12.0
+            base_score += 8.0
 
         if (
             freshness >= 90
             and urgency >= 80
         ):
-            value += 8.0
+            base_score += 7.0
+
+        # Confirmed ineligible.
+        if eligibility <= 0:
+            base_score *= 0.20
+
+        # Partially known / weak eligibility.
+        elif eligibility < 50:
+            base_score *= 0.55
+
+        # Unknown eligibility.
+        elif eligibility < 75:
+            base_score *= 0.80
+
+            # Recent target jobs without matching information
+            # must remain discoverable for REVIEW.
+            if (
+                freshness >= 80
+                and match_score <= 0
+            ):
+                base_score += 6.0
 
         return round(
             max(
                 0.0,
                 min(
                     100.0,
-                    value,
+                    base_score,
                 ),
             ),
             2,
         )
-
-    # ============================================================
-    # ACTION
-    # ============================================================
 
     @classmethod
     def choose_action(
@@ -1067,7 +1207,6 @@ class LocalAgentBrain:
         application_status: str = "",
         match_available: bool = True,
     ) -> str:
-
         status = cls.text(
             application_status
         ).lower()
