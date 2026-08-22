@@ -118,9 +118,9 @@ class AgentMemory:
         """
         Record one agent event.
 
-        The method is intentionally flexible so existing pipeline
-        objects can provide additional fields without requiring
-        changes to the memory schema.
+        Additional fields can be supplied through ``extra`` so that
+        application/execution pipelines can preserve useful context
+        without coupling this class to those pipelines.
         """
 
         normalized_event = self._text(
@@ -210,6 +210,10 @@ class AgentMemory:
         """
         Record an application outcome in the format consumed by
         AgentLearning.
+
+        This method intentionally records an observed outcome only.
+        It does not infer downstream outcomes such as interviews,
+        offers, or rejections.
         """
 
         normalized_outcome = self._text(
@@ -230,6 +234,100 @@ class AgentMemory:
             priority_score=priority_score,
             match_score=match_score,
             metadata=metadata,
+            save=save,
+            **extra,
+        )
+
+    # ============================================================
+    # EXECUTION OUTCOME
+    # ============================================================
+
+    def record_execution_outcome(
+        self,
+        *,
+        outcome: str,
+        job_id: str | None = None,
+        role_class: str | None = None,
+        application_route: str | None = None,
+        decision: str | None = None,
+        status: str | None = None,
+        success: bool | None = None,
+        submitted: bool | None = None,
+        sent: bool | None = None,
+        priority_score: float | None = None,
+        match_score: float | None = None,
+        candidate_fit_score: float | None = None,
+        eligibility_score: float | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        save: bool = True,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """
+        Record an outcome observed directly from application
+        execution.
+
+        This is deliberately separate from
+        ``record_application_outcome`` so later-stage outcomes such
+        as ``interview`` or ``offer`` can continue to be recorded
+        explicitly without confusing them with execution results.
+        """
+
+        execution_metadata: dict[str, Any] = {}
+
+        if metadata is not None:
+            execution_metadata.update(
+                dict(metadata)
+            )
+
+        self._add_if_present(
+            execution_metadata,
+            "decision",
+            decision,
+        )
+
+        self._add_if_present(
+            execution_metadata,
+            "status",
+            status,
+        )
+
+        if success is not None:
+            execution_metadata[
+                "success"
+            ] = bool(success)
+
+        if submitted is not None:
+            execution_metadata[
+                "submitted"
+            ] = bool(submitted)
+
+        if sent is not None:
+            execution_metadata[
+                "sent"
+            ] = bool(sent)
+
+        if candidate_fit_score is not None:
+            execution_metadata[
+                "candidate_fit_score"
+            ] = self._number(
+                candidate_fit_score
+            )
+
+        if eligibility_score is not None:
+            execution_metadata[
+                "eligibility_score"
+            ] = self._number(
+                eligibility_score
+            )
+
+        return self.record_application_outcome(
+            outcome=outcome,
+            job_id=job_id,
+            role_class=role_class,
+            application_route=application_route,
+            priority_score=priority_score,
+            match_score=match_score,
+            metadata=execution_metadata,
             save=save,
             **extra,
         )
@@ -344,6 +442,62 @@ class AgentMemory:
             event="application_outcome",
             job_id=job_id,
         )
+
+    def execution_history(
+        self,
+        *,
+        role_class: str | None = None,
+        job_id: str | None = None,
+        outcome: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Return execution-derived application outcomes.
+
+        Execution outcomes are identified by the execution metadata
+        marker stored by ``record_execution_outcome``.
+        """
+
+        records = self.application_history(
+            role_class=role_class,
+            job_id=job_id,
+        )
+
+        result: list[
+            dict[str, Any]
+        ] = []
+
+        for record in records:
+            metadata = record.get(
+                "metadata"
+            )
+
+            if not isinstance(
+                metadata,
+                Mapping,
+            ):
+                continue
+
+            if "decision" not in metadata:
+                continue
+
+            if outcome is not None:
+                if (
+                    self._normalize(
+                        record.get(
+                            "outcome"
+                        )
+                    )
+                    != self._normalize(
+                        outcome
+                    )
+                ):
+                    continue
+
+            result.append(
+                dict(record)
+            )
+
+        return result
 
     # ============================================================
     # STATISTICS

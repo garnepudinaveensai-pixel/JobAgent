@@ -132,6 +132,7 @@ class ApplicationExecutionRouter:
         application_pipeline: Any = None,
         outreach_pipeline: Any = None,
         review_handler: Any = None,
+        memory: Any = None,
     ):
         self.decision_engine = (
             decision_engine
@@ -150,6 +151,10 @@ class ApplicationExecutionRouter:
         self.review_handler = (
             review_handler
         )
+
+        # Optional persistent execution memory. Memory failures must
+        # never break application execution.
+        self.memory = memory
 
     # ========================================================
     # SINGLE JOB
@@ -697,6 +702,22 @@ class ApplicationExecutionRouter:
                 metadata["outreach_status"] = "outreach_failed"
                 metadata["outreach_error"] = str(exc)
 
+        self._record_memory_outcome(
+            ranked_result=ranked_result,
+            job=job,
+            decision=APPLY,
+            outcome=(
+                "applied"
+                if success
+                else "failed"
+            ),
+            status=submission_status,
+            success=success,
+            submitted=submitted_flag,
+            sent=bool(metadata.get("outreach_sent", False)),
+            ranking_score=ranking_score,
+        )
+
         return ExecutionResult(
             success=success,
             decision=APPLY,
@@ -921,17 +942,36 @@ class ApplicationExecutionRouter:
             )
         )
 
+        outreach_status = str(
+            sent.get(
+                "status",
+                "sent"
+                if success
+                else "outreach_send_failed",
+            )
+        )
+
+        self._record_memory_outcome(
+            ranked_result=ranked_result,
+            job=job,
+            decision=OUTREACH,
+            outcome=(
+                "outreach_sent"
+                if success
+                else "outreach_failed"
+            ),
+            status=outreach_status,
+            success=success,
+            sent=bool(
+                sent.get("sent", success)
+            ),
+            ranking_score=ranking_score,
+        )
+
         return ExecutionResult(
             success=success,
             decision=OUTREACH,
-            status=str(
-                sent.get(
-                    "status",
-                    "sent"
-                    if success
-                    else "outreach_send_failed",
-                )
-            ),
+            status=outreach_status,
             message=(
                 "Outreach sent successfully."
                 if success
@@ -1006,6 +1046,16 @@ class ApplicationExecutionRouter:
                     error=str(exc),
                 )
 
+        self._record_memory_outcome(
+            ranked_result=ranked_result,
+            job=job,
+            decision=REVIEW,
+            outcome="review",
+            status="manual_review",
+            success=True,
+            ranking_score=ranking_score,
+        )
+
         return ExecutionResult(
             success=True,
             decision=REVIEW,
@@ -1073,28 +1123,28 @@ class ApplicationExecutionRouter:
             pipeline,
             "prepare_application_for_job",
         ):
-            return pipeline.prepare_application_for_job(
-                ranked_result,
+            method = pipeline.prepare_application_for_job
+            return self._call_application_preparer(
+                method,
+                ranked_result=ranked_result,
                 page=page,
                 fields=fields,
                 resume=resume,
-                resume_output_path=(
-                    resume_output_path
-                ),
+                resume_output_path=resume_output_path,
             )
 
         if hasattr(
             pipeline,
             "prepare_application",
         ):
-            return pipeline.prepare_application(
-                ranked_result,
+            method = pipeline.prepare_application
+            return self._call_application_preparer(
+                method,
+                ranked_result=ranked_result,
                 page=page,
                 fields=fields,
                 resume=resume,
-                resume_output_path=(
-                    resume_output_path
-                ),
+                resume_output_path=resume_output_path,
             )
 
         raise TypeError(
@@ -1104,7 +1154,99 @@ class ApplicationExecutionRouter:
         )
 
     @staticmethod
+    def _call_application_preparer(
+        method: Any,
+        *,
+        ranked_result: Mapping[str, Any],
+        page: Any,
+        fields: dict[str, Any],
+        resume: Optional[dict],
+        resume_output_path: Optional[str],
+    ) -> Any:
+        """
+        Invoke an application preparation adapter while supporting both
+        production adapters that accept ``ranked_result`` positionally
+        and lightweight test/integration adapters that accept only
+        keyword arguments.
+
+        This is intentionally signature-based rather than catching
+        TypeError from the adapter implementation, so genuine TypeError
+        failures inside a pipeline are still surfaced to the router.
+        """
+        candidates = {
+            "page": page,
+            "fields": fields,
+            "resume": resume,
+            "resume_output_path": resume_output_path,
+        }
+
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            # Preserve the historical production calling convention when
+            # the callable cannot be inspected.
+            return method(
+                ranked_result,
+                **candidates,
+            )
+
+        positional_parameters = [
+            parameter
+            for parameter in parameters.values()
+            if parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+
+        accepts_var_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+        # If the adapter explicitly exposes a first positional parameter,
+        # use the established ranked_result positional contract.
+        if positional_parameters:
+            kwargs = (
+                dict(candidates)
+                if accepts_var_kwargs
+                else {
+                    name: value
+                    for name, value in candidates.items()
+                    if name in parameters
+                }
+            )
+            return method(
+                ranked_result,
+                **kwargs,
+            )
+
+        # Keyword-only / **kwargs adapters receive the ranked result as a
+        # keyword. This is the shape used by the lightweight test doubles.
+        kwargs = dict(candidates)
+        if accepts_var_kwargs or "ranked_result" in parameters:
+            kwargs["ranked_result"] = ranked_result
+        elif "job" in parameters:
+            kwargs["job"] = (
+                dict(ranked_result.get("job", {}))
+                if isinstance(
+                    ranked_result.get("job"),
+                    Mapping,
+                )
+                else {}
+            )
+
+        kwargs = {
+            name: value
+            for name, value in kwargs.items()
+            if accepts_var_kwargs or name in parameters
+        }
+
+        return method(**kwargs)
+
     def _submit_application(
+        self,
         prepared: Mapping[str, Any],
         *,
         confirm: bool,
@@ -1122,18 +1264,75 @@ class ApplicationExecutionRouter:
                 confirm=confirm
             )
 
+        # Some application pipelines return only a preparation mapping and
+        # keep submission on the pipeline instance itself. Support that
+        # contract as well as the older prepared["pipeline"] contract.
         pipeline_result = prepared.get(
             "pipeline"
         )
 
-        if pipeline_result is not None and hasattr(
-            pipeline_result,
+        submit_pipeline = (
+            pipeline_result
+            if pipeline_result is not None
+            else self.application_pipeline
+        )
+
+        if submit_pipeline is not None and hasattr(
+            submit_pipeline,
             "submit_application",
         ):
-            return pipeline_result.submit_application(
-                prepared,
-                confirm=confirm,
+            method = submit_pipeline.submit_application
+            candidates = {
+                "prepared": prepared,
+                "application": prepared,
+                "confirm": confirm,
+            }
+
+            try:
+                parameters = inspect.signature(method).parameters
+            except (TypeError, ValueError):
+                return method(
+                    prepared,
+                    confirm=confirm,
+                )
+
+            accepts_var_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
             )
+
+            positional_parameters = [
+                parameter
+                for parameter in parameters.values()
+                if parameter.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            ]
+
+            # Normal production/test contract:
+            # submit_application(prepared, confirm=False)
+            if positional_parameters:
+                kwargs = {
+                    "confirm": confirm,
+                }
+                if accepts_var_kwargs or "confirm" in parameters:
+                    kwargs["confirm"] = confirm
+                return method(prepared, **kwargs)
+
+            # Keyword-only adapters. Prefer the explicit parameter name.
+            kwargs = {}
+            if accepts_var_kwargs or "prepared" in parameters:
+                kwargs["prepared"] = prepared
+            elif "application" in parameters:
+                kwargs["application"] = prepared
+
+            if accepts_var_kwargs or "confirm" in parameters:
+                kwargs["confirm"] = confirm
+
+            if kwargs:
+                return method(**kwargs)
 
         if prepared.get(
             "submitted"
@@ -1280,6 +1479,91 @@ class ApplicationExecutionRouter:
     # EXTRACTION
     # ========================================================
 
+    def _record_memory_outcome(
+        self,
+        *,
+        ranked_result: Mapping[str, Any],
+        job: Mapping[str, Any],
+        decision: str,
+        outcome: str,
+        status: str,
+        success: bool | None = None,
+        submitted: bool | None = None,
+        sent: bool | None = None,
+        ranking_score: float | None = None,
+    ) -> None:
+        """Best-effort persistence of observed execution outcomes."""
+
+        if self.memory is None:
+            return
+
+        role_class = (
+            job.get("role_class")
+            or ranked_result.get("role_class")
+            or ranked_result.get("role_classification")
+        )
+
+        if not role_class:
+            intelligence = ranked_result.get("intelligence")
+            if isinstance(intelligence, Mapping):
+                role_class = (
+                    intelligence.get("role_class")
+                    or intelligence.get("role_classification")
+                )
+
+        match = ranked_result.get("match")
+        match_score = None
+        if isinstance(match, Mapping):
+            match_score = match.get("match_score")
+
+        try:
+            recorder = getattr(
+                self.memory,
+                "record_execution_outcome",
+                None,
+            )
+            if callable(recorder):
+                recorder(
+                    outcome=outcome,
+                    role_class=(
+                        str(role_class).strip()
+                        if role_class is not None
+                        else None
+                    ),
+                    application_route=decision,
+                    decision=decision,
+                    status=status,
+                    success=success,
+                    submitted=submitted,
+                    sent=sent,
+                    priority_score=ranking_score,
+                    match_score=match_score,
+                )
+                return
+
+            # Backward-compatible fallback for older memory objects.
+            recorder = getattr(
+                self.memory,
+                "record_application_outcome",
+                None,
+            )
+            if callable(recorder):
+                recorder(
+                    outcome=outcome,
+                    role_class=(
+                        str(role_class).strip()
+                        if role_class is not None
+                        else None
+                    ),
+                    application_route=decision,
+                    priority_score=ranking_score,
+                    match_score=match_score,
+                )
+        except Exception:
+            # Memory is an auxiliary learning system. It must never
+            # make a real application or outreach operation fail.
+            return
+
     @staticmethod
     def _extract_job(
         ranked_result: Mapping[str, Any],
@@ -1330,6 +1614,7 @@ def execute_ranked_job(
     application_pipeline: Any = None,
     outreach_pipeline: Any = None,
     review_handler: Any = None,
+    memory: Any = None,
     **kwargs: Any,
 ) -> ExecutionResult:
     """
@@ -1341,6 +1626,7 @@ def execute_ranked_job(
         application_pipeline=application_pipeline,
         outreach_pipeline=outreach_pipeline,
         review_handler=review_handler,
+        memory=memory,
     )
 
     return router.route(
