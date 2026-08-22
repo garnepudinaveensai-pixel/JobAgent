@@ -31,14 +31,23 @@ VALID_DECISIONS = {
 @dataclass(frozen=True)
 class ApplicationDecisionConfig:
     """
-    Configuration controlling automatic application decisions.
+    Controls the final action selected by JobAgent.
 
-    Default thresholds:
+    Existing application behavior is preserved:
 
-        >= 85 -> APPLY
-        >= 70 -> REVIEW
-        >= 50 -> OUTREACH when no application URL exists
-        <  50 -> SKIP
+        APPLY
+            ranking score >= 85 and an application route exists
+
+        REVIEW
+            ranking score >= 70 but below APPLY threshold
+
+        OUTREACH
+            ranking score >= 50 and direct application route
+            is unavailable
+
+        SKIP
+            ranking score < 50, ineligible, closed, duplicate,
+            or explicitly rejected by job intelligence
     """
 
     apply_score: float = 85.0
@@ -50,6 +59,8 @@ class ApplicationDecisionConfig:
     outreach_when_application_unavailable: bool = True
 
     skip_ineligible: bool = True
+
+    require_technical_target: bool = True
 
     def __post_init__(self) -> None:
         values = (
@@ -83,7 +94,7 @@ class ApplicationDecisionConfig:
 @dataclass(frozen=True)
 class ApplicationDecision:
     """
-    Structured result returned by ApplicationDecisionEngine.
+    Structured decision returned by the decision engine.
     """
 
     decision: str
@@ -114,10 +125,6 @@ class ApplicationDecision:
             )
 
     def to_dict(self) -> dict[str, Any]:
-        """
-        Convert the decision into a plain dictionary.
-        """
-
         return {
             "decision": self.decision,
             "reason": self.reason,
@@ -132,40 +139,52 @@ class ApplicationDecision:
                 dict(self.selected_resume)
                 if isinstance(
                     self.selected_resume,
-                    dict,
+                    Mapping,
                 )
                 else self.selected_resume
             ),
-            "recommended_action": self.recommended_action,
-            "metadata": dict(self.metadata),
+            "recommended_action": (
+                self.recommended_action
+            ),
+            "metadata": dict(
+                self.metadata
+            ),
         }
 
 
 # ============================================================
-# APPLICATION DECISION ENGINE
+# DECISION ENGINE
 # ============================================================
 
 
 class ApplicationDecisionEngine:
     """
-    Decide what JobAgent should do with a ranked job.
+    Final reasoning layer between ranking and execution.
 
-    Possible decisions:
+    Flow:
 
-        APPLY
-        OUTREACH
-        REVIEW
-        SKIP
+        ranked job
+            ↓
+        job intelligence
+            ↓
+        hard safety / relevance guards
+            ↓
+        eligibility
+            ↓
+        match information
+            ↓
+        required skills
+            ↓
+        score thresholds
+            ↓
+        APPLY / REVIEW / OUTREACH / SKIP
 
-    This class does not:
+    Important compatibility rule:
 
-        - discover jobs
-        - rank jobs
-        - match resumes
-        - send emails
-        - submit applications
-
-    It only determines the recommended next action.
+    Existing score-based application behavior remains the
+    source of truth for final routing. Job intelligence adds
+    intelligence and safety guards around that behavior rather
+    than overriding established score thresholds.
     """
 
     def __init__(
@@ -188,9 +207,6 @@ class ApplicationDecisionEngine:
         self,
         ranked_result: Mapping[str, Any],
     ) -> ApplicationDecision:
-        """
-        Decide the next action for one ranked job result.
-        """
 
         if not isinstance(
             ranked_result,
@@ -204,6 +220,11 @@ class ApplicationDecisionEngine:
             ranked_result.get("job")
         )
 
+        match_present = isinstance(
+            ranked_result.get("match"),
+            Mapping,
+        )
+
         match = self._get_mapping(
             ranked_result.get("match")
         )
@@ -215,14 +236,9 @@ class ApplicationDecisionEngine:
             )
         )
 
-        match_score = self._score(
-            match.get(
-                "match_score",
-                ranked_result.get(
-                    "match_score",
-                    0,
-                ),
-            )
+        match_score = self._extract_match_score(
+            ranked_result,
+            match,
         )
 
         eligible = self._get_eligibility(
@@ -251,30 +267,145 @@ class ApplicationDecisionEngine:
             )
         )
 
-        intelligence = JobIntelligence.analyze(job)
+        # ----------------------------------------------------
+        # JOB INTELLIGENCE
+        # ----------------------------------------------------
 
-        # Hard role guard: the agent must not apply to sales, BD, HR,
-        # marketing, plumbing/mixed roles, or other explicitly excluded
-        # non-technical positions merely because resume similarity happens
-        # to produce a high score.
-        if not intelligence["technical_target"]:
+        intelligence = (
+            ranked_result.get(
+                "job_intelligence"
+            )
+        )
+
+        if not isinstance(
+            intelligence,
+            Mapping,
+        ):
+            intelligence = JobIntelligence.analyze(
+                job
+            )
+
+        intelligence = dict(
+            intelligence
+        )
+
+        technical_target = bool(
+            intelligence.get(
+                "technical_target",
+                False,
+            )
+        )
+
+        role_class = str(
+            intelligence.get(
+                "role_class",
+                "uncertain",
+            )
+        )
+
+        confidence = self._score(
+            intelligence.get(
+                "confidence",
+                0,
+            )
+        )
+
+        priority_score = self._score(
+            intelligence.get(
+                "priority_score",
+                ranked_result.get(
+                    "priority_score",
+                    0,
+                ),
+            )
+        )
+
+        intelligence_action = str(
+            intelligence.get(
+                "recommended_action",
+                "",
+            )
+        ).strip().upper()
+
+        metadata = {
+            "job_intelligence": intelligence,
+            "technical_target": technical_target,
+            "role_class": role_class,
+            "intelligence_confidence": confidence,
+            "priority_score": priority_score,
+            "intelligence_recommended_action": (
+                intelligence_action
+            ),
+            "match_available": match_present,
+        }
+
+        # ----------------------------------------------------
+        # HARD TARGET GUARD
+        # ----------------------------------------------------
+
+        if (
+            self.config.require_technical_target
+            and not technical_target
+        ):
             return self._result(
                 decision=SKIP,
                 reason=(
-                    "The role was classified as non-target or uncertain "
-                    "for the configured technical/software job strategy."
+                    "Job intelligence classified this role "
+                    "as non-target or uncertain. Automatic "
+                    "application is blocked."
                 ),
                 ranking_score=ranking_score,
                 match_score=match_score,
                 eligible=eligible,
-                missing_required_skills=missing_required,
+                missing_required_skills=(
+                    missing_required
+                ),
                 application_url=application_url,
                 selected_resume=selected_resume,
-                metadata={"job_intelligence": intelligence},
+                metadata=metadata,
             )
 
         # ----------------------------------------------------
-        # INELIGIBLE
+        # STATUS GUARD
+        # ----------------------------------------------------
+
+        status = str(
+            job.get(
+                "status",
+                ranked_result.get(
+                    "status",
+                    "",
+                ),
+            )
+            or ""
+        ).strip().lower()
+
+        if status in {
+            "closed",
+            "expired",
+            "withdrawn",
+            "duplicate",
+            "job_unavailable",
+        }:
+            return self._result(
+                decision=SKIP,
+                reason=(
+                    f"Job status is '{status}' and the "
+                    "application should not proceed."
+                ),
+                ranking_score=ranking_score,
+                match_score=match_score,
+                eligible=eligible,
+                missing_required_skills=(
+                    missing_required
+                ),
+                application_url=application_url,
+                selected_resume=selected_resume,
+                metadata=metadata,
+            )
+
+        # ----------------------------------------------------
+        # ELIGIBILITY GUARD
         # ----------------------------------------------------
 
         if (
@@ -285,7 +416,7 @@ class ApplicationDecisionEngine:
                 decision=SKIP,
                 reason=(
                     "The job is marked as ineligible "
-                    "for the selected candidate."
+                    "for the candidate."
                 ),
                 ranking_score=ranking_score,
                 match_score=match_score,
@@ -295,21 +426,56 @@ class ApplicationDecisionEngine:
                 ),
                 application_url=application_url,
                 selected_resume=selected_resume,
+                metadata=metadata,
             )
 
         # ----------------------------------------------------
-        # MISSING REQUIRED SKILLS
+        # MISSING MATCH INFORMATION
+        # ----------------------------------------------------
+
+        if not match_present:
+            return self._result(
+                decision=REVIEW,
+                reason=(
+                    "Resume matching has not been completed "
+                    "for this job. The job remains reviewable "
+                    "but must not be automatically submitted."
+                ),
+                ranking_score=ranking_score,
+                match_score=match_score,
+                eligible=eligible,
+                missing_required_skills=(
+                    missing_required
+                ),
+                application_url=application_url,
+                selected_resume=selected_resume,
+                metadata=metadata,
+            )
+
+        # ----------------------------------------------------
+        # REQUIRED SKILLS
         # ----------------------------------------------------
 
         if (
             missing_required
             and self.config.review_on_missing_required_skills
         ):
+            metadata = dict(
+                metadata
+            )
+
+            metadata[
+                "missing_required_skill_count"
+            ] = len(
+                missing_required
+            )
+
             return self._result(
                 decision=REVIEW,
                 reason=(
-                    "The job has missing required skills "
-                    "and should be reviewed before applying."
+                    "Required skills are missing. "
+                    "Human review is required before "
+                    "application."
                 ),
                 ranking_score=ranking_score,
                 match_score=match_score,
@@ -319,20 +485,52 @@ class ApplicationDecisionEngine:
                 ),
                 application_url=application_url,
                 selected_resume=selected_resume,
+                metadata=metadata,
             )
 
         # ----------------------------------------------------
-        # HIGH SCORE
+        # INTELLIGENCE HARD SKIP
         # ----------------------------------------------------
+
+        # Intelligence is allowed to prevent an application.
+        # It is NOT allowed to turn an already low score into
+        # REVIEW or to override the established score routing.
+        if intelligence_action == SKIP:
+            return self._result(
+                decision=SKIP,
+                reason=(
+                    "The job intelligence layer explicitly "
+                    "recommended SKIP."
+                ),
+                ranking_score=ranking_score,
+                match_score=match_score,
+                eligible=eligible,
+                missing_required_skills=(
+                    missing_required
+                ),
+                application_url=application_url,
+                selected_resume=selected_resume,
+                metadata=metadata,
+            )
+
+        # ----------------------------------------------------
+        # SCORE-BASED ROUTING
+        # ----------------------------------------------------
+
+        # ====================================================
+        # APPLY
+        # ====================================================
 
         if ranking_score >= self.config.apply_score:
 
+            # A direct application route exists.
             if application_url:
                 return self._result(
                     decision=APPLY,
                     reason=(
-                        "Strong ranked match with an "
-                        "application URL available."
+                        "Strong technical match, eligibility "
+                        "confirmed, and an application route "
+                        "is available."
                     ),
                     ranking_score=ranking_score,
                     match_score=match_score,
@@ -342,8 +540,10 @@ class ApplicationDecisionEngine:
                     ),
                     application_url=application_url,
                     selected_resume=selected_resume,
+                    metadata=metadata,
                 )
 
+            # No direct application URL.
             if (
                 self.config
                 .outreach_when_application_unavailable
@@ -351,8 +551,8 @@ class ApplicationDecisionEngine:
                 return self._result(
                     decision=OUTREACH,
                     reason=(
-                        "Strong ranked match, but no direct "
-                        "application URL is available."
+                        "Strong technical match, but no "
+                        "direct application URL is available."
                     ),
                     ranking_score=ranking_score,
                     match_score=match_score,
@@ -362,13 +562,22 @@ class ApplicationDecisionEngine:
                     ),
                     application_url=application_url,
                     selected_resume=selected_resume,
+                    metadata=metadata,
                 )
 
+        # ====================================================
+        # REVIEW
+        # ====================================================
+
+        if (
+            ranking_score
+            >= self.config.review_score
+        ):
             return self._result(
                 decision=REVIEW,
                 reason=(
-                    "Strong ranked match, but the "
-                    "application route is unavailable."
+                    "The job is relevant but does not yet "
+                    "meet the automatic application threshold."
                 ),
                 ranking_score=ranking_score,
                 match_score=match_score,
@@ -378,36 +587,17 @@ class ApplicationDecisionEngine:
                 ),
                 application_url=application_url,
                 selected_resume=selected_resume,
+                metadata=metadata,
             )
 
-        # ----------------------------------------------------
-        # MEDIUM SCORE
-        # ----------------------------------------------------
+        # ====================================================
+        # OUTREACH
+        # ====================================================
 
-        if ranking_score >= self.config.review_score:
-            return self._result(
-                decision=REVIEW,
-                reason=(
-                    "The job is a potentially suitable "
-                    "match but does not meet the automatic "
-                    "application threshold."
-                ),
-                ranking_score=ranking_score,
-                match_score=match_score,
-                eligible=eligible,
-                missing_required_skills=(
-                    missing_required
-                ),
-                application_url=application_url,
-                selected_resume=selected_resume,
-            )
-
-        # ----------------------------------------------------
-        # OUTREACH RANGE
-        # ----------------------------------------------------
-
-        if ranking_score >= self.config.outreach_score:
-
+        if (
+            ranking_score
+            >= self.config.outreach_score
+        ):
             if (
                 self.config
                 .outreach_when_application_unavailable
@@ -416,9 +606,9 @@ class ApplicationDecisionEngine:
                 return self._result(
                     decision=OUTREACH,
                     reason=(
-                        "The job meets the minimum outreach "
-                        "threshold and has no direct "
-                        "application URL."
+                        "The job meets the outreach threshold "
+                        "but does not expose a direct "
+                        "application route."
                     ),
                     ranking_score=ranking_score,
                     match_score=match_score,
@@ -428,13 +618,14 @@ class ApplicationDecisionEngine:
                     ),
                     application_url=application_url,
                     selected_resume=selected_resume,
+                    metadata=metadata,
                 )
 
             return self._result(
                 decision=REVIEW,
                 reason=(
-                    "The job is above the minimum threshold "
-                    "but requires manual review before action."
+                    "The job is potentially relevant but "
+                    "requires manual review."
                 ),
                 ranking_score=ranking_score,
                 match_score=match_score,
@@ -444,16 +635,17 @@ class ApplicationDecisionEngine:
                 ),
                 application_url=application_url,
                 selected_resume=selected_resume,
+                metadata=metadata,
             )
 
-        # ----------------------------------------------------
-        # LOW SCORE
-        # ----------------------------------------------------
+        # ====================================================
+        # SKIP
+        # ====================================================
 
         return self._result(
             decision=SKIP,
             reason=(
-                "The ranking score is below the minimum "
+                "The job does not meet the minimum "
                 "threshold for further action."
             ),
             ranking_score=ranking_score,
@@ -464,10 +656,11 @@ class ApplicationDecisionEngine:
             ),
             application_url=application_url,
             selected_resume=selected_resume,
+            metadata=metadata,
         )
 
     # ========================================================
-    # BATCH DECISIONS
+    # BATCH
     # ========================================================
 
     def decide_many(
@@ -476,15 +669,6 @@ class ApplicationDecisionEngine:
             Mapping[str, Any]
         ],
     ) -> list[ApplicationDecision]:
-        """
-        Decide actions for multiple ranked results.
-
-        ranked_results MUST be a list.
-
-        None and other types are rejected deliberately so that
-        invalid pipeline data is detected immediately instead
-        of silently producing an empty result.
-        """
 
         if not isinstance(
             ranked_results,
@@ -495,12 +679,14 @@ class ApplicationDecisionEngine:
             )
 
         return [
-            self.decide(result)
+            self.decide(
+                result
+            )
             for result in ranked_results
         ]
 
     # ========================================================
-    # FILTERING
+    # FILTER
     # ========================================================
 
     def filter_by_decision(
@@ -509,10 +695,9 @@ class ApplicationDecisionEngine:
             Mapping[str, Any]
         ],
         decision: str,
-    ) -> list[Mapping[str, Any]]:
-        """
-        Return original ranked results matching a decision.
-        """
+    ) -> list[
+        Mapping[str, Any]
+    ]:
 
         if decision not in VALID_DECISIONS:
             raise ValueError(
@@ -527,31 +712,23 @@ class ApplicationDecisionEngine:
                 "ranked_results must be a list."
             )
 
-        results: list[
-            Mapping[str, Any]
-        ] = []
-
-        for result in ranked_results:
-            result_decision = self.decide(
+        return [
+            result
+            for result in ranked_results
+            if self.decide(
                 result
-            )
-
-            if (
-                result_decision.decision
-                == decision
-            ):
-                results.append(result)
-
-        return results
+            ).decision == decision
+        ]
 
     # ========================================================
-    # INTERNAL HELPERS
+    # HELPERS
     # ========================================================
 
     @staticmethod
     def _get_mapping(
         value: Any,
     ) -> Mapping[str, Any]:
+
         if isinstance(
             value,
             Mapping,
@@ -564,8 +741,11 @@ class ApplicationDecisionEngine:
     def _score(
         value: Any,
     ) -> float:
+
         try:
-            score = float(value)
+            score = float(
+                value
+            )
         except (
             TypeError,
             ValueError,
@@ -580,11 +760,34 @@ class ApplicationDecisionEngine:
             ),
         )
 
+    @classmethod
+    def _extract_match_score(
+        cls,
+        ranked_result: Mapping[str, Any],
+        match: Mapping[str, Any],
+    ) -> float:
+
+        value = match.get(
+            "match_score",
+            match.get(
+                "resume_score",
+                ranked_result.get(
+                    "match_score",
+                    0,
+                ),
+            ),
+        )
+
+        return cls._score(
+            value
+        )
+
     @staticmethod
     def _get_eligibility(
         ranked_result: Mapping[str, Any],
         match: Mapping[str, Any],
     ) -> bool:
+
         value = match.get(
             "eligible",
             ranked_result.get(
@@ -597,14 +800,19 @@ class ApplicationDecisionEngine:
             value,
             str,
         ):
-            return value.strip().lower() in {
-                "true",
-                "1",
-                "yes",
-                "eligible",
-            }
+            return (
+                value.strip().lower()
+                in {
+                    "true",
+                    "1",
+                    "yes",
+                    "eligible",
+                }
+            )
 
-        return bool(value)
+        return bool(
+            value
+        )
 
     @staticmethod
     def _extract_missing_required_skills(
@@ -647,19 +855,23 @@ class ApplicationDecisionEngine:
                 item
             ).strip()
 
-            if value and value not in result:
-                result.append(value)
+            if (
+                value
+                and value not in result
+            ):
+                result.append(
+                    value
+                )
 
-        return tuple(result)
+        return tuple(
+            result
+        )
 
     @staticmethod
     def _extract_application_url(
         ranked_result: Mapping[str, Any],
         job: Mapping[str, Any],
     ) -> str:
-        """
-        Resolve the best available application URL.
-        """
 
         candidates = (
             ranked_result.get(
@@ -712,7 +924,9 @@ class ApplicationDecisionEngine:
                 value,
                 Mapping,
             ):
-                return dict(value)
+                return dict(
+                    value
+                )
 
         return None
 
@@ -727,7 +941,9 @@ class ApplicationDecisionEngine:
         missing_required_skills: tuple[str, ...],
         application_url: str,
         selected_resume: Optional[dict],
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: Optional[
+            dict[str, Any]
+        ] = None,
     ) -> ApplicationDecision:
 
         recommended_action = {
@@ -746,10 +962,18 @@ class ApplicationDecisionEngine:
             missing_required_skills=(
                 missing_required_skills
             ),
-            application_url=application_url,
-            selected_resume=selected_resume,
-            recommended_action=recommended_action,
-            metadata=dict(metadata or {}),
+            application_url=(
+                application_url
+            ),
+            selected_resume=(
+                selected_resume
+            ),
+            recommended_action=(
+                recommended_action
+            ),
+            metadata=dict(
+                metadata or {}
+            ),
         )
 
 
@@ -764,9 +988,6 @@ def decide_application_action(
         ApplicationDecisionConfig
     ] = None,
 ) -> dict[str, Any]:
-    """
-    Convenience wrapper returning a dictionary.
-    """
 
     engine = ApplicationDecisionEngine(
         config=config
@@ -775,11 +996,6 @@ def decide_application_action(
     return engine.decide(
         ranked_result
     ).to_dict()
-
-
-# ============================================================
-# PUBLIC API
-# ============================================================
 
 
 __all__ = [
