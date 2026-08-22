@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
 
 from app.agents.agent_brain import LocalAgentBrain
+from app.agents.agent_learning import AgentLearning
 
 
 class JobIntelligence:
@@ -22,12 +23,11 @@ class JobIntelligence:
           ↓
         Candidate fit
           ↓
+        Historical learning
+          ↓
         Adaptive priority
           ↓
         APPLY / REVIEW / SKIP
-
-    The class remains deterministic and does not make external
-    network or LLM calls.
     """
 
     EXCLUDED_TITLE_TERMS = (
@@ -115,7 +115,20 @@ class JobIntelligence:
     def analyze(
         cls,
         job: Mapping[str, Any],
+        history: (
+            Iterable[Mapping[str, Any]]
+            | None
+        ) = None,
     ) -> dict[str, Any]:
+        """
+        Analyze one job.
+
+        ``history`` is optional so all existing callers remain
+        backward compatible.
+
+        When supplied, historical application outcomes are used
+        as a conservative learning signal for the detected role.
+        """
 
         if not isinstance(
             job,
@@ -146,39 +159,47 @@ class JobIntelligence:
             f"{title} {description}"
         )
 
-        # --------------------------------------------------------
-        # 1. Role intelligence
-        # --------------------------------------------------------
+        # ========================================================
+        # 1. ROLE INTELLIGENCE
+        # ========================================================
 
-        brain = LocalAgentBrain.classify_job(
-            job
+        brain = (
+            LocalAgentBrain.classify_job(
+                job
+            )
         )
 
-        # --------------------------------------------------------
-        # 2. Freshness / urgency
-        # --------------------------------------------------------
+        # ========================================================
+        # 2. FRESHNESS / URGENCY
+        # ========================================================
 
-        freshness = cls._freshness_score(
-            combined,
-            job,
+        freshness = (
+            cls._freshness_score(
+                combined,
+                job,
+            )
         )
 
-        urgency = cls._urgency_score(
-            combined.lower()
+        urgency = (
+            cls._urgency_score(
+                combined.lower()
+            )
         )
 
-        # --------------------------------------------------------
-        # 3. Application route
-        # --------------------------------------------------------
+        # ========================================================
+        # 3. APPLICATION ROUTE
+        # ========================================================
 
-        route = cls._application_route(
-            url,
-            job,
+        route = (
+            cls._application_route(
+                url,
+                job,
+            )
         )
 
-        # --------------------------------------------------------
-        # 4. Match information
-        # --------------------------------------------------------
+        # ========================================================
+        # 4. MATCH INFORMATION
+        # ========================================================
 
         match = job.get("match")
 
@@ -207,9 +228,9 @@ class JobIntelligence:
             )
         )
 
-        # --------------------------------------------------------
-        # 5. Candidate-fit intelligence
-        # --------------------------------------------------------
+        # ========================================================
+        # 5. CANDIDATE FIT
+        # ========================================================
 
         candidate_fit = (
             LocalAgentBrain.evaluate_candidate_fit(
@@ -223,9 +244,9 @@ class JobIntelligence:
             )
         )
 
-        # --------------------------------------------------------
-        # 6. Normalize match score for priority/action
-        # --------------------------------------------------------
+        # ========================================================
+        # 6. NORMALIZE MATCH
+        # ========================================================
 
         match_available = (
             match_score_raw is not None
@@ -253,19 +274,21 @@ class JobIntelligence:
             ),
         )
 
-        # --------------------------------------------------------
-        # 7. Eligibility score for priority
-        # --------------------------------------------------------
+        # ========================================================
+        # 7. ELIGIBILITY
+        # ========================================================
 
-        eligibility_score = candidate_fit[
-            "eligibility_score"
-        ]
+        eligibility_score = (
+            candidate_fit[
+                "eligibility_score"
+            ]
+        )
 
-        # --------------------------------------------------------
-        # 8. Adaptive priority
-        # --------------------------------------------------------
+        # ========================================================
+        # 8. BASE PRIORITY
+        # ========================================================
 
-        priority = (
+        base_priority = (
             LocalAgentBrain.rank_priority(
                 target=brain.target,
                 freshness=freshness,
@@ -275,9 +298,55 @@ class JobIntelligence:
             )
         )
 
-        # --------------------------------------------------------
-        # 9. Recommended action
-        # --------------------------------------------------------
+        # ========================================================
+        # 9. HISTORICAL LEARNING
+        # ========================================================
+
+        learning = (
+            AgentLearning.analyze_history(
+                history,
+                role_class=(
+                    brain.intent
+                    if brain.target
+                    else None
+                ),
+            )
+        )
+
+        learning_score = (
+            learning[
+                "learning_score"
+            ]
+        )
+
+        learning_confidence = (
+            learning[
+                "confidence"
+            ]
+        )
+
+        # Historical learning must never create priority for
+        # a non-target job.
+        if brain.target:
+            learned_priority = (
+                AgentLearning.adjust_priority(
+                    priority_score=base_priority,
+                    learning_score=learning_score,
+                    confidence=learning_confidence,
+                )
+            )
+        else:
+            learned_priority = 0.0
+
+        learning_adjustment = round(
+            learned_priority
+            - base_priority,
+            2,
+        )
+
+        # ========================================================
+        # 10. RECOMMENDED ACTION
+        # ========================================================
 
         recommended_action = (
             LocalAgentBrain.choose_action(
@@ -293,13 +362,15 @@ class JobIntelligence:
                 application_status=cls._text(
                     job.get("status")
                 ),
-                match_available=match_available,
+                match_available=(
+                    match_available
+                ),
             )
         )
 
-        # --------------------------------------------------------
-        # 10. Explainable priority reasoning
-        # --------------------------------------------------------
+        # ========================================================
+        # 11. EXPLAINABLE REASONS
+        # ========================================================
 
         reasons = [
             brain.reason,
@@ -320,13 +391,17 @@ class JobIntelligence:
             )
 
         reasons.append(
-            f"candidate_fit="
-            f"{candidate_fit['fit_level']}"
+            "candidate_fit="
+            + str(
+                candidate_fit[
+                    "fit_level"
+                ]
+            )
         )
 
         reasons.append(
-            f"candidate_fit_score="
-            f"{candidate_fit['candidate_fit_score']:.1f}"
+            "candidate_fit_score="
+            + f"{candidate_fit['candidate_fit_score']:.1f}"
         )
 
         if candidate_fit[
@@ -336,16 +411,28 @@ class JobIntelligence:
                 "required skills missing"
             )
 
+        if learning_confidence > 0:
+            reasons.append(
+                "historical learning="
+                + f"{learning_score:.1f}"
+            )
+
         reasons.append(
             f"route={route}"
         )
+
+        # ========================================================
+        # 12. RESULT
+        # ========================================================
 
         return {
             # ----------------------------------------------------
             # Role intelligence
             # ----------------------------------------------------
 
-            "technical_target": brain.target,
+            "technical_target": (
+                brain.target
+            ),
 
             "role_class": (
                 brain.intent
@@ -439,10 +526,62 @@ class JobIntelligence:
             ),
 
             # ----------------------------------------------------
-            # Priority / action
+            # Historical learning
             # ----------------------------------------------------
 
-            "priority_score": priority,
+            "learning_score": (
+                learning_score
+            ),
+
+            "learning_confidence": (
+                learning_confidence
+            ),
+
+            "learning_adjustment": (
+                learning_adjustment
+            ),
+
+            "learning_reason": (
+                learning[
+                    "reason"
+                ]
+            ),
+
+            "learning_history_count": (
+                learning[
+                    "history_count"
+                ]
+            ),
+
+            "learning_successful_count": (
+                learning[
+                    "successful_count"
+                ]
+            ),
+
+            "learning_negative_count": (
+                learning[
+                    "negative_count"
+                ]
+            ),
+
+            "learning_success_rate": (
+                learning[
+                    "success_rate"
+                ]
+            ),
+
+            # ----------------------------------------------------
+            # Priority
+            # ----------------------------------------------------
+
+            "base_priority_score": (
+                base_priority
+            ),
+
+            "priority_score": (
+                learned_priority
+            ),
 
             "priority_reason": (
                 "; ".join(
@@ -450,12 +589,16 @@ class JobIntelligence:
                 )
             ),
 
+            # ----------------------------------------------------
+            # Decision
+            # ----------------------------------------------------
+
             "recommended_action": (
                 recommended_action
             ),
 
             # ----------------------------------------------------
-            # Application route / metadata
+            # Application
             # ----------------------------------------------------
 
             "application_route": route,
