@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 from app.agents.agent_brain import LocalAgentBrain
 from app.agents.agent_learning import AgentLearning
+from app.agents.agent_memory import AgentMemory
 
 
 class JobIntelligence:
@@ -28,6 +29,16 @@ class JobIntelligence:
         Adaptive priority
           ↓
         APPLY / REVIEW / SKIP
+
+    Historical learning can be supplied either through:
+
+        history=[...]
+
+    or automatically through:
+
+        memory=AgentMemory(...)
+
+    Explicit ``history`` takes precedence over automatic memory.
     """
 
     EXCLUDED_TITLE_TERMS = (
@@ -119,15 +130,29 @@ class JobIntelligence:
             Iterable[Mapping[str, Any]]
             | None
         ) = None,
+        memory: AgentMemory | None = None,
     ) -> dict[str, Any]:
         """
         Analyze one job.
 
-        ``history`` is optional so all existing callers remain
-        backward compatible.
+        Parameters
+        ----------
+        job:
+            Job data.
 
-        When supplied, historical application outcomes are used
-        as a conservative learning signal for the detected role.
+        history:
+            Optional explicit application history.
+
+        memory:
+            Optional AgentMemory instance.
+
+        Priority of history sources
+        ----------------------------
+        1. Explicit ``history`` when supplied.
+        2. ``memory.application_history()`` otherwise.
+        3. Empty history when neither is supplied.
+
+        This preserves backward compatibility with existing callers.
         """
 
         if not isinstance(
@@ -160,7 +185,7 @@ class JobIntelligence:
         )
 
         # ========================================================
-        # 1. ROLE INTELLIGENCE
+        # ROLE INTELLIGENCE
         # ========================================================
 
         brain = (
@@ -170,7 +195,7 @@ class JobIntelligence:
         )
 
         # ========================================================
-        # 2. FRESHNESS / URGENCY
+        # FRESHNESS / URGENCY
         # ========================================================
 
         freshness = (
@@ -187,7 +212,7 @@ class JobIntelligence:
         )
 
         # ========================================================
-        # 3. APPLICATION ROUTE
+        # APPLICATION ROUTE
         # ========================================================
 
         route = (
@@ -198,7 +223,7 @@ class JobIntelligence:
         )
 
         # ========================================================
-        # 4. MATCH INFORMATION
+        # MATCH INFORMATION
         # ========================================================
 
         match = job.get("match")
@@ -229,7 +254,7 @@ class JobIntelligence:
         )
 
         # ========================================================
-        # 5. CANDIDATE FIT
+        # CANDIDATE FIT
         # ========================================================
 
         candidate_fit = (
@@ -245,7 +270,7 @@ class JobIntelligence:
         )
 
         # ========================================================
-        # 6. NORMALIZE MATCH
+        # NORMALIZE MATCH
         # ========================================================
 
         match_available = (
@@ -275,7 +300,7 @@ class JobIntelligence:
         )
 
         # ========================================================
-        # 7. ELIGIBILITY
+        # ELIGIBILITY
         # ========================================================
 
         eligibility_score = (
@@ -285,7 +310,7 @@ class JobIntelligence:
         )
 
         # ========================================================
-        # 8. BASE PRIORITY
+        # BASE PRIORITY
         # ========================================================
 
         base_priority = (
@@ -299,12 +324,28 @@ class JobIntelligence:
         )
 
         # ========================================================
-        # 9. HISTORICAL LEARNING
+        # HISTORICAL LEARNING SOURCE
+        # ========================================================
+
+        learning_history = (
+            cls._resolve_learning_history(
+                history=history,
+                memory=memory,
+                role_class=(
+                    brain.intent
+                    if brain.target
+                    else None
+                ),
+            )
+        )
+
+        # ========================================================
+        # HISTORICAL LEARNING
         # ========================================================
 
         learning = (
             AgentLearning.analyze_history(
-                history,
+                learning_history,
                 role_class=(
                     brain.intent
                     if brain.target
@@ -325,8 +366,8 @@ class JobIntelligence:
             ]
         )
 
-        # Historical learning must never create priority for
-        # a non-target job.
+        # Historical learning can never create priority
+        # for a non-target job.
         if brain.target:
             learned_priority = (
                 AgentLearning.adjust_priority(
@@ -345,7 +386,7 @@ class JobIntelligence:
         )
 
         # ========================================================
-        # 10. RECOMMENDED ACTION
+        # RECOMMENDED ACTION
         # ========================================================
 
         recommended_action = (
@@ -369,7 +410,7 @@ class JobIntelligence:
         )
 
         # ========================================================
-        # 11. EXPLAINABLE REASONS
+        # EXPLAINABLE REASONS
         # ========================================================
 
         reasons = [
@@ -422,7 +463,7 @@ class JobIntelligence:
         )
 
         # ========================================================
-        # 12. RESULT
+        # RESULT
         # ========================================================
 
         return {
@@ -605,6 +646,71 @@ class JobIntelligence:
 
             "company": company,
         }
+
+    # ============================================================
+    # LEARNING HISTORY RESOLUTION
+    # ============================================================
+
+    @classmethod
+    def _resolve_learning_history(
+        cls,
+        *,
+        history: (
+            Iterable[Mapping[str, Any]]
+            | None
+        ),
+        memory: AgentMemory | None,
+        role_class: str | None,
+    ) -> list[Mapping[str, Any]]:
+        """
+        Resolve the source of historical outcomes.
+
+        Explicit history always wins.
+
+        Memory is only queried when explicit history is None.
+        """
+
+        if history is not None:
+            return [
+                item
+                for item in history
+                if isinstance(
+                    item,
+                    Mapping,
+                )
+            ]
+
+        if memory is None:
+            return []
+
+        if not isinstance(
+            memory,
+            AgentMemory,
+        ):
+            raise TypeError(
+                "memory must be an AgentMemory instance."
+            )
+
+        try:
+            records = (
+                memory.application_history(
+                    role_class=role_class
+                )
+            )
+        except AttributeError as exc:
+            raise TypeError(
+                "memory must provide "
+                "application_history()."
+            ) from exc
+
+        return [
+            item
+            for item in records
+            if isinstance(
+                item,
+                Mapping,
+            )
+        ]
 
     # ============================================================
     # FRESHNESS
